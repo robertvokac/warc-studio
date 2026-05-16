@@ -53,6 +53,9 @@ find_package(SQLite3 REQUIRED)
 # POSIX threads
 find_package(Threads REQUIRED)
 
+# OpenSSL — used for SHA-256 checksum computation on archive files
+find_package(OpenSSL REQUIRED)
+
 # ---------------------------------------------------------------------------
 # Application target
 # ---------------------------------------------------------------------------
@@ -84,6 +87,7 @@ target_link_libraries(warc-studio
         Crow::Crow
         SQLite::SQLite3
         Threads::Threads
+        OpenSSL::Crypto
 )
 
 if(MSVC)
@@ -92,4 +96,13 @@ else()
     target_compile_options(warc-studio PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# Copy the static/ directory to the build output so the app can serve CSS and favicon.
+add_custom_command(TARGET warc-studio POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/static"
+        "${CMAKE_CURRENT_BINARY_DIR}/static"
+    COMMENT "Copying static assets to build directory"
+)
+
 install(TARGETS warc-studio RUNTIME DESTINATION bin)
+install(DIRECTORY static/ DESTINATION share/warc-studio/static)

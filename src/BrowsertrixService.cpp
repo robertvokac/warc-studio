@@ -5,6 +5,9 @@
 #include <filesystem>
 #include <format>
 #include <stdexcept>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 namespace warc_studio {
 namespace {
@@ -50,6 +53,50 @@ void runShellCommand(const std::string& command, const std::string& description)
     }
 }
 
+// Fire-and-forget: run command in background shell without blocking the caller.
+// Uses double-fork so the child is immediately reparented to init and the parent
+// can return without waiting. This avoids any blocking in std::system().
+void runShellCommandDetached(const std::string& command) {
+    // First fork: parent returns immediately after waitpid on the intermediate child.
+    const pid_t child = ::fork();
+    if (child < 0) {
+        // fork failed — silently ignore; the command will not run.
+        return;
+    }
+    if (child == 0) {
+        // Intermediate child: create a new session so the grandchild is not in
+        // the same process group and won't receive signals meant for the server.
+        ::setsid();
+
+        // Second fork: the grandchild is the actual worker; the intermediate
+        // child exits immediately so init adopts the grandchild.
+        const pid_t grandchild = ::fork();
+        if (grandchild != 0) {
+            // Intermediate child exits now (success or fork failure both exit).
+            ::_exit(0);
+        }
+
+        // Grandchild: redirect stdin/stdout/stderr to /dev/null.
+        const int devNull = ::open("/dev/null", O_RDWR);
+        if (devNull >= 0) {
+            ::dup2(devNull, STDIN_FILENO);
+            ::dup2(devNull, STDOUT_FILENO);
+            ::dup2(devNull, STDERR_FILENO);
+            if (devNull > STDERR_FILENO) ::close(devNull);
+        }
+
+        // Execute command via shell.
+        ::execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+        // execl only returns on failure — exit with error code.
+        ::_exit(127);
+    }
+
+    // Parent: wait for the intermediate child to exit (it exits immediately after
+    // the second fork, so this waitpid returns in microseconds).
+    int status = 0;
+    ::waitpid(child, &status, 0);
+}
+
 std::string makeBrowsertrixId(int entryId) {
     return "crawl_entry_" + std::to_string(entryId);
 }
@@ -77,32 +124,32 @@ RecordingStartResult BrowsertrixService::startRecording(const Entry& entry) cons
     std::filesystem::create_directories(fileService_.crawlsRoot());
 
     // Remove any leftover container with the same name (e.g. from a previous failed run).
-    // First stop (gracefully), then force-remove. Both are no-ops when the container is absent.
-    const std::string stopCleanupCommand = std::format(
-        "docker stop {} >/dev/null 2>&1 || true",
-        shellQuote(containerName(browsertrixId))
-    );
-    std::system(stopCleanupCommand.c_str());
+    // Use force-remove only (skips graceful stop) so cleanup is fast and non-blocking.
+    // HACK: wrap with 'sg docker -c ...' so that the current user inherits the docker group
+    // without requiring a re-login. Remove once the user is permanently added to the docker group.
     const std::string rmCleanupCommand = std::format(
-        "docker rm -f {} >/dev/null 2>&1 || true",
-        shellQuote(containerName(browsertrixId))
+        "sg docker -c 'docker rm -f {} >/dev/null 2>&1 || true'",
+        containerName(browsertrixId)
     );
-    std::system(rmCleanupCommand.c_str());
+    runShellCommandDetached(rmCleanupCommand);
 
     // This Docker command is deliberately kept in one place.
     // For a real interactive Browsertrix service, replace this command with an API call
     // that starts an interactive browser session and returns the browser URL.
+    // HACK: wrap with 'sg docker -c ...' so the current user inherits the docker group
+    // without requiring a re-login. Remove once the user is permanently added to the docker group.
     const std::string command = std::format(
-        "docker run -d --name {} -v {}:/crawls {} crawl --url {} --generateWACZ --text --collection {} --crawlId {}",
-        shellQuote(containerName(browsertrixId)),
-        shellQuote(fileService_.crawlsRoot().string()),
-        shellQuote(image_),
-        shellQuote(entry.url),
-        shellQuote(browsertrixId),
-        shellQuote(browsertrixId)
+        "sg docker -c 'docker run -d --name {} -v {}:/crawls {} crawl --url {} --generateWACZ --text --collection {} --crawlId {}'",
+        containerName(browsertrixId),
+        fileService_.crawlsRoot().string(),
+        image_,
+        entry.url,
+        browsertrixId,
+        browsertrixId
     );
 
-    runShellCommand(command, "docker run for entry " + std::to_string(entry.id));
+    // Launch the container in a fire-and-forget manner so the HTTP handler returns immediately.
+    runShellCommandDetached(command);
 
     return RecordingStartResult{
         .browsertrixId = browsertrixId,
@@ -147,18 +194,16 @@ RecordingStopResult BrowsertrixService::stopRecording(const Entry& entry) const 
         };
     }
 
-    // docker stop is allowed to fail when the container already finished.
-    const std::string stopCommand = std::format(
-        "docker stop {} >/dev/null 2>&1 || true",
-        shellQuote(containerName(browsertrixId))
+    // Stop and remove the container. docker stop can take up to 10 s by default.
+    // We run it synchronously so that the WACZ file is fully written before we look for it.
+    // If the container has already finished on its own, docker stop is a fast no-op.
+    // HACK: wrap with 'sg docker -c ...' so the current user inherits the docker group
+    // without requiring a re-login. Remove once the user is permanently added to the docker group.
+    const std::string stopAndRemoveCommand = std::format(
+        "sg docker -c 'docker stop {0} >/dev/null 2>&1 || true; docker rm -f {0} >/dev/null 2>&1 || true'",
+        containerName(browsertrixId)
     );
-    std::system(stopCommand.c_str());
-
-    const std::string removeCommand = std::format(
-        "docker rm -f {} >/dev/null 2>&1 || true",
-        shellQuote(containerName(browsertrixId))
-    );
-    std::system(removeCommand.c_str());
+    runShellCommand(stopAndRemoveCommand, "docker stop/rm for " + browsertrixId);
 
     // findGeneratedWacz throws a descriptive error when the directory or file is missing.
     // This usually means the crawl did not finish or the container failed to start.

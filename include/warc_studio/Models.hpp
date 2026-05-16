@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,16 +16,18 @@ struct Collection {
 struct Entry {
     int id{};
     int collectionId{};
+    int numberPerCollection{};
     std::string collectionName;
     std::string url;
     std::optional<std::string> normalizedUrl;
     std::optional<std::string> title;
-    std::string status;   // new | recording | archived | failed
+    std::string status;   // new | queued | recording | archived | imported | failed | needs_review | ignored
     std::optional<std::string> note;
     std::string createdAt;
     std::string updatedAt;
     std::optional<std::string> archivedAt;
     std::optional<std::string> lastError;
+    int archiveFileCount{};
 
     // Legacy columns kept for backward compatibility during migration.
     // New code should prefer ArchiveFile and CrawlRun.
@@ -37,7 +40,9 @@ struct ArchiveFile {
     int entryId{};
     std::string path;
     std::string fileType;  // wacz | warc
-    std::optional<int> sizeBytes;
+    std::optional<std::string> label;
+    std::optional<std::string> source;
+    std::optional<std::int64_t> sizeBytes;
     std::optional<std::string> sha256;
     std::string createdAt;
 };

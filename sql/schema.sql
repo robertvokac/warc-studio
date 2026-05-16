@@ -15,6 +15,8 @@ CREATE TABLE schema_version (
 --   1 — initial schema: collection + entry (with warc_path and browsertrix_id)
 --   2 — extended schema: new columns on collection/entry, plus archive_file, crawl_run,
 --         capture_metadata, tag, entry_tag, entry_note; data migration from warc_path/browsertrix_id
+--   3 — per-collection entry numbering (number_per_collection on entry);
+--         label and source columns on archive_file
 
 -- ---------------------------------------------------------------------------
 -- Core tables
@@ -29,23 +31,26 @@ CREATE TABLE collection (
 );
 
 CREATE TABLE entry (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection_id  INTEGER NOT NULL,
-    url            TEXT NOT NULL,
-    normalized_url TEXT,
-    title          TEXT,
-    status         TEXT NOT NULL DEFAULT 'new',  -- new | recording | archived | failed
-    note           TEXT,
-    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    archived_at    DATETIME,
-    last_error     TEXT,
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id          INTEGER NOT NULL,
+    number_per_collection  INTEGER NOT NULL,   -- sequential per collection, starts at 1
+    url                    TEXT NOT NULL,
+    normalized_url         TEXT,
+    title                  TEXT,
+    status                 TEXT NOT NULL DEFAULT 'new',
+        -- new | queued | recording | archived | imported | failed | needs_review | ignored
+    note                   TEXT,
+    created_at             DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at             DATETIME DEFAULT CURRENT_TIMESTAMP,
+    archived_at            DATETIME,
+    last_error             TEXT,
 
     -- Legacy columns kept for backward compatibility; prefer archive_file and crawl_run.
-    warc_path      TEXT,
-    browsertrix_id TEXT,
+    warc_path              TEXT,
+    browsertrix_id         TEXT,
 
-    FOREIGN KEY (collection_id) REFERENCES collection(id) ON DELETE CASCADE
+    FOREIGN KEY (collection_id) REFERENCES collection(id) ON DELETE CASCADE,
+    UNIQUE (collection_id, number_per_collection)
 );
 
 -- ---------------------------------------------------------------------------
@@ -56,7 +61,9 @@ CREATE TABLE archive_file (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     entry_id   INTEGER NOT NULL,
     path       TEXT NOT NULL,
-    file_type  TEXT NOT NULL DEFAULT 'wacz',
+    file_type  TEXT NOT NULL DEFAULT 'wacz',   -- wacz | warc
+    label      TEXT,                           -- e.g. "browsertrix recording", "manual upload"
+    source     TEXT NOT NULL DEFAULT 'browsertrix',  -- browsertrix | manual_upload | imported
     size_bytes INTEGER,
     sha256     TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,

@@ -2,6 +2,7 @@
 
 #include "warc_studio/Models.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <sqlite3.h>
@@ -27,18 +28,30 @@ public:
 
     // Entries
     int createEntry(int collectionId, const std::string& url, const std::optional<std::string>& title = std::nullopt);
+    int getNextEntryNumberForCollection(int collectionId) const;
     std::vector<Entry> listEntries() const;
     std::vector<Entry> listEntriesByCollection(int collectionId) const;
     std::optional<Entry> getEntry(int id) const;
+    void updateEntry(int entryId, const std::string& url, const std::string& title, const std::string& note);
     void updateEntryStatus(int entryId, const std::string& status);
     void setEntryError(int entryId, const std::string& errorMessage);
     void markEntryArchived(int entryId);
+    void markEntryImportedIfNew(int entryId);
 
     // Archive files
     int addArchiveFile(int entryId, const std::string& path, const std::string& fileType = "wacz",
-                       const std::optional<int>& sizeBytes = std::nullopt,
+                       const std::optional<std::string>& label = std::nullopt,
+                       const std::optional<std::string>& source = std::nullopt,
+                       const std::optional<std::int64_t>& sizeBytes = std::nullopt,
                        const std::optional<std::string>& sha256 = std::nullopt);
+    std::vector<ArchiveFile> listArchiveFilesForEntry(int entryId) const;
+    std::vector<ArchiveFile> listArchiveFilesForCollection(int collectionId) const;
+    std::optional<ArchiveFile> getArchiveFileById(int archiveFileId) const;
+    void updateArchiveFileLabel(int archiveFileId, const std::string& label);
+    void deleteArchiveFile(int archiveFileId);
     std::optional<ArchiveFile> getLatestArchiveFile(int entryId) const;
+    std::optional<ArchiveFile> getLatestWaczArchiveFile(int entryId) const;
+    int countArchiveFilesForEntry(int entryId) const;
 
     // Crawl runs
     int createCrawlRun(int entryId, const std::optional<std::string>& browsertrixId,
@@ -47,6 +60,8 @@ public:
     void updateCrawlRunStopped(int crawlRunId, const std::string& status,
                                const std::optional<int>& exitCode = std::nullopt,
                                const std::optional<std::string>& errorMessage = std::nullopt);
+    std::vector<CrawlRun> listCrawlRunsForEntry(int entryId) const;
+    std::optional<CrawlRun> getLatestActiveCrawlRunForEntry(int entryId) const;
 
     // Entry notes
     int addEntryNote(int entryId, const std::string& body);
@@ -70,6 +85,7 @@ private:
     int getSchemaVersion() const;
     void setSchemaVersion(int version);
     void migrateSchema();
+    void populateNumberPerCollection();
 };
 
 } // namespace warc_studio
