@@ -143,8 +143,71 @@ int main() {
             [&database](const crow::request& request) {
                 try {
                     const auto form = warc_studio::parseUrlEncoded(request.body);
-                    database.createCollection(requiredTextField(form, "name"));
+                    const std::string name = requiredTextField(form, "name");
+                    const auto description = optionalTextField(form, "description");
+                    database.createCollection(name, description);
                     return redirectWithMessage("Collection was created.");
+                } catch (const std::exception& error) {
+                    return redirectWithMessage(std::string("Error: ") + error.what());
+                }
+            }
+        );
+
+        CROW_ROUTE(app, "/collection/<int>")(
+            [&database](const crow::request& request, int collectionId) {
+                const auto collection = database.getCollection(collectionId);
+                if (!collection) {
+                    return crow::response(404, "Collection not found");
+                }
+                const char* message = request.url_params.get("message");
+                const auto entries = database.listEntriesByCollection(collectionId);
+                const auto latestArchiveFiles = buildLatestArchiveFiles(database, entries);
+                return htmlResponse(warc_studio::renderCollectionDetailPage(
+                    *collection,
+                    entries,
+                    latestArchiveFiles,
+                    message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message}
+                ));
+            }
+        );
+
+        CROW_ROUTE(app, "/collection/<int>/edit").methods(crow::HTTPMethod::POST)(
+            [&database](const crow::request& request, int collectionId) {
+                try {
+                    const auto form = warc_studio::parseUrlEncoded(request.body);
+                    const std::string name = requiredTextField(form, "name");
+                    const auto description = optionalTextField(form, "description");
+                    database.updateCollection(collectionId, name, description);
+                    crow::response response(302);
+                    response.add_header("Location",
+                        "/collection/" + std::to_string(collectionId) + "?message=Collection+was+updated.");
+                    return response;
+                } catch (const std::exception& error) {
+                    crow::response response(302);
+                    response.add_header("Location",
+                        "/collection/" + std::to_string(collectionId)
+                        + "?message=Error%3A+" + warc_studio::urlEncode(error.what()));
+                    return response;
+                }
+            }
+        );
+
+        CROW_ROUTE(app, "/collection/<int>/delete").methods(crow::HTTPMethod::POST)(
+            [&database, &fileService](int collectionId) {
+                try {
+                    // Delete archive files for all entries in this collection before removing DB rows.
+                    const auto entries = database.listEntriesByCollection(collectionId);
+                    for (const auto& entry : entries) {
+                        const auto archiveFile = database.getLatestArchiveFile(entry.id);
+                        if (archiveFile) {
+                            fileService.deleteStoredArchiveIfPresent(archiveFile->path);
+                        }
+                        if (entry.warcPath && !entry.warcPath->empty()) {
+                            fileService.deleteStoredArchiveIfPresent(entry.warcPath);
+                        }
+                    }
+                    database.deleteCollection(collectionId);
+                    return redirectWithMessage("Collection was deleted.");
                 } catch (const std::exception& error) {
                     return redirectWithMessage(std::string("Error: ") + error.what());
                 }

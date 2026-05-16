@@ -412,6 +412,26 @@ std::optional<Collection> Database::getCollection(int id) const {
     return std::nullopt;
 }
 
+void Database::updateCollection(int id, const std::string& name, const std::optional<std::string>& description) {
+    Statement stmt(db_,
+        "UPDATE collection SET name = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;");
+    stmt.bindText(1, name);
+    stmt.bindOptionalText(2, description);
+    stmt.bindInt(3, id);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(sqlite3_errmsg(db_));
+    }
+}
+
+void Database::deleteCollection(int id) {
+    // ON DELETE CASCADE will remove all entries (and their children) automatically.
+    Statement stmt(db_, "DELETE FROM collection WHERE id = ?;");
+    stmt.bindInt(1, id);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(sqlite3_errmsg(db_));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entries
 // ---------------------------------------------------------------------------
@@ -472,6 +492,36 @@ int Database::createEntry(int collectionId, const std::string& url, const std::o
 
 std::vector<Entry> Database::listEntries() const {
     Statement stmt(db_, kListEntriesSQL);
+    std::vector<Entry> result;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        result.push_back(readEntry(stmt.get()));
+    }
+    return result;
+}
+
+std::vector<Entry> Database::listEntriesByCollection(int collectionId) const {
+    Statement stmt(db_, R"SQL(
+        SELECT
+            e.id,
+            e.collection_id,
+            c.name,
+            e.url,
+            e.normalized_url,
+            e.title,
+            e.status,
+            e.note,
+            e.created_at,
+            e.updated_at,
+            e.archived_at,
+            e.last_error,
+            e.warc_path,
+            e.browsertrix_id
+        FROM entry e
+        JOIN collection c ON c.id = e.collection_id
+        WHERE e.collection_id = ?
+        ORDER BY e.id DESC;
+    )SQL");
+    stmt.bindInt(1, collectionId);
     std::vector<Entry> result;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         result.push_back(readEntry(stmt.get()));

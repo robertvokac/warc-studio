@@ -22,10 +22,13 @@ public:
     int createCollection(const std::string& name, const std::optional<std::string>& description = std::nullopt);
     std::vector<Collection> listCollections() const;
     std::optional<Collection> getCollection(int id) const;
+    void updateCollection(int id, const std::string& name, const std::optional<std::string>& description);
+    void deleteCollection(int id);
 
     // Entries
     int createEntry(int collectionId, const std::string& url, const std::optional<std::string>& title = std::nullopt);
     std::vector<Entry> listEntries() const;
+    std::vector<Entry> listEntriesByCollection(int collectionId) const;
     std::optional<Entry> getEntry(int id) const;
     void updateEntryStatus(int entryId, const std::string& status);
     void setEntryError(int entryId, const std::string& errorMessage);

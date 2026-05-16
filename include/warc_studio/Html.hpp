@@ -17,4 +17,12 @@ std::string renderIndexPage(
     const std::optional<std::string>& message
 );
 
+// Detail page for a single collection: shows collection info, edit form, delete button, and its entries.
+std::string renderCollectionDetailPage(
+    const Collection& collection,
+    const std::vector<Entry>& entries,
+    const std::map<int, ArchiveFile>& latestArchiveFiles,
+    const std::optional<std::string>& message
+);
+
 } // namespace warc_studio

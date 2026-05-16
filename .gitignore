@@ -13,7 +13,7 @@ compile_commands.json
 CTestTestfile.cmake
 _deps/
 
-# vcpkg
+# vcpkg installed tree (not required; ignored in case someone uses vcpkg locally)
 vcpkg_installed/
 
 # Application runtime data (SQLite database, WACZ archives, crawl output)
