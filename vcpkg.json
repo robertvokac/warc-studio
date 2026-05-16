@@ -1,0 +1,9 @@
+{
+  "name": "warc-studio",
+  "version-string": "0.1.0",
+  "description": "Small C++23 archive studio for Browsertrix, WACZ files, and ReplayWeb.page.",
+  "dependencies": [
+    "crow",
+    "sqlite3"
+  ]
+}
