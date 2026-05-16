@@ -1,6 +1,7 @@
 #include "warc_studio/Html.hpp"
 #include "warc_studio/HttpUtil.hpp"
 
+#include <map>
 #include <sstream>
 
 namespace warc_studio {
@@ -13,11 +14,29 @@ std::string displayTitle(const Entry& entry) {
     return entry.url;
 }
 
+// Returns a short human-readable label for an entry status value.
+std::string statusLabel(const std::string& status) {
+    if (status == "new")       return "new";
+    if (status == "recording") return "recording";
+    if (status == "archived")  return "archived";
+    if (status == "failed")    return "failed";
+    return status;
+}
+
+// Returns an inline CSS color suitable for a status badge.
+std::string statusColor(const std::string& status) {
+    if (status == "archived")  return "#1a7f37";
+    if (status == "recording") return "#bf8700";
+    if (status == "failed")    return "#b00020";
+    return "#555";
+}
+
 } // namespace
 
 std::string renderIndexPage(
     const std::vector<Collection>& collections,
     const std::vector<Entry>& entries,
+    const std::map<int, ArchiveFile>& latestArchiveFiles,
     const std::optional<std::string>& message
 ) {
     std::ostringstream html;
@@ -44,6 +63,8 @@ std::string renderIndexPage(
     .muted { opacity: 0.75; font-size: 0.9rem; }
     .danger { color: #b00020; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .status-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 0.4rem; font-size: 0.8rem; font-weight: 600; color: #fff; }
+    .error-text { color: #b00020; font-size: 0.85rem; margin-top: 0.3rem; }
   </style>
 </head>
 <body>
@@ -65,7 +86,6 @@ std::string renderIndexPage(
     <button type="submit">Create collection</button>
   </form>
 </section>
-
 <section class="card">
   <h2>New entry</h2>
   <form method="post" action="/entry/new">
@@ -82,7 +102,6 @@ std::string renderIndexPage(
     <button type="submit">Create entry</button>
   </form>
 </section>
-
 <section>
   <h2>Entries</h2>
   <table>
@@ -91,8 +110,8 @@ std::string renderIndexPage(
         <th>ID</th>
         <th>Collection</th>
         <th>Title / URL</th>
-        <th>Browsertrix ID</th>
-        <th>WACZ path</th>
+        <th>Status</th>
+        <th>Archive file</th>
         <th>Actions</th>
       </tr>
     </thead>
@@ -100,19 +119,50 @@ std::string renderIndexPage(
 )HTML";
 
     for (const auto& entry : entries) {
+        const auto archiveIt = latestArchiveFiles.find(entry.id);
+        const bool hasArchive = archiveIt != latestArchiveFiles.end();
+
         html << "      <tr>\n";
         html << "        <td>" << entry.id << "</td>\n";
         html << "        <td>" << htmlEscape(entry.collectionName) << "</td>\n";
-        html << "        <td><strong>" << htmlEscape(displayTitle(entry)) << "</strong><br><span class=\"muted\">" << htmlEscape(entry.url) << "</span></td>\n";
-        html << "        <td class=\"mono\">" << htmlEscape(entry.browsertrixId.value_or("")) << "</td>\n";
-        html << "        <td class=\"mono\">" << htmlEscape(entry.warcPath.value_or("")) << "</td>\n";
-        html << "        <td>\n";
-        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/start\"><button type=\"submit\">Start recording</button></form>\n";
-        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/stop\"><button type=\"submit\">Stop recording</button></form>\n";
-        if (entry.warcPath && !entry.warcPath->empty()) {
-            html << "          <form method=\"get\" action=\"/entry/" << entry.id << "/replay\" target=\"_blank\"><button type=\"submit\">Replay</button></form>\n";
+
+        // Title / URL cell
+        html << "        <td><strong>" << htmlEscape(displayTitle(entry)) << "</strong>"
+             << "<br><span class=\"muted\">" << htmlEscape(entry.url) << "</span></td>\n";
+
+        // Status badge + optional error
+        html << "        <td>"
+             << "<span class=\"status-badge\" style=\"background:" << statusColor(entry.status) << "\">"
+             << htmlEscape(statusLabel(entry.status)) << "</span>";
+        if (entry.lastError && !entry.lastError->empty()) {
+            html << "<div class=\"error-text\">" << htmlEscape(*entry.lastError) << "</div>";
         }
-        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/delete\" onsubmit=\"return confirm('Delete this entry and its local WACZ file?')\"><button class=\"danger\" type=\"submit\">Delete</button></form>\n";
+        html << "</td>\n";
+
+        // Archive file cell
+        html << "        <td class=\"mono\">";
+        if (hasArchive) {
+            const auto& af = archiveIt->second;
+            // Show only the filename part to keep the cell compact.
+            const auto slash = af.path.rfind('/');
+            const std::string fname = slash == std::string::npos ? af.path : af.path.substr(slash + 1);
+            html << "<span title=\"" << htmlEscape(af.path) << "\">" << htmlEscape(fname) << "</span>";
+        }
+        html << "</td>\n";
+
+        // Action buttons
+        html << "        <td>\n";
+        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/start\">"
+             << "<button type=\"submit\">Start recording</button></form>\n";
+        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/stop\">"
+             << "<button type=\"submit\">Stop recording</button></form>\n";
+        if (hasArchive) {
+            html << "          <form method=\"get\" action=\"/entry/" << entry.id << "/replay\" target=\"_blank\">"
+                 << "<button type=\"submit\">Replay</button></form>\n";
+        }
+        html << "          <form method=\"post\" action=\"/entry/" << entry.id
+             << "/delete\" onsubmit=\"return confirm('Delete this entry and its local archive file?')\">"
+             << "<button class=\"danger\" type=\"submit\">Delete</button></form>\n";
         html << "        </td>\n";
         html << "      </tr>\n";
     }

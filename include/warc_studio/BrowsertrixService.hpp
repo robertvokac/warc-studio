@@ -11,6 +11,7 @@ namespace warc_studio {
 
 struct RecordingStartResult {
     std::string browsertrixId;
+    std::string dockerContainerName;  // docker container name used, may be empty if Browsertrix is disabled
     std::string message;
 };
 

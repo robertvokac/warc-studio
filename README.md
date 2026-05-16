@@ -5,7 +5,7 @@
 The code is intentionally simple and modular:
 
 - **Crow** is used as the embedded HTTP server.
-- **SQLite** stores collections and entries (with WARC/WACZ paths).
+- **SQLite** stores collections, entries, archive files, crawl runs, tags, notes, and capture metadata.
 - **BrowsertrixService** isolates all Browsertrix Crawler integration.
 - WACZ files are served from `/archives/…` with CORS and HTTP Range support.
 - Replay is done by redirecting to `https://replayweb.page/?source=…`.
@@ -16,9 +16,9 @@ The code is intentionally simple and modular:
 
 1. You create a **collection** (logical group, e.g. "research", "project-x").
 2. You add an **entry** (a URL you want to archive).
-3. You click **Start recording** → a Browsertrix Crawler container starts, Chromium opens interactively, and you browse the page manually.
-4. You click **Stop recording** → the container stops, the generated WACZ file is copied to `data/archives/<collectionId>/<entryId>.wacz`, and the path is stored in SQLite.
-5. You click **Replay** → you are redirected to ReplayWeb.page, which downloads the WACZ from the local server and replays the archived site in your browser — no backend replay server needed.
+3. You click **Start recording** → a `crawl_run` row is created, the entry status is set to `recording`, a Browsertrix Crawler container starts, Chromium opens interactively, and you browse the page manually.
+4. You click **Stop recording** → the container stops, the generated WACZ file is copied to `data/archives/<collectionId>/<entryId>.wacz`, a row is inserted into `archive_file`, and the entry status is set to `archived`.
+5. You click **Replay** → the latest `archive_file` is used to build the ReplayWeb.page URL; the archived site replays in your browser with no backend replay server needed.
 
 ---
 
@@ -43,7 +43,7 @@ warc-studio/
     FileService.cpp
     Html.cpp
     HttpUtil.cpp
-  sql/schema.sql          # SQLite schema reference
+  sql/schema.sql          # SQLite schema reference (human-readable)
   scripts/
     run-browsertrix-example.sh
   data/                   # Created at runtime (excluded from git)
@@ -111,10 +111,10 @@ http://localhost:18080/
 | `GET` | `/health` | Health check — returns `ok` |
 | `POST` | `/collection/new` | Create a new collection |
 | `POST` | `/entry/new` | Create a new entry |
-| `POST` | `/entry/<id>/start` | Start interactive recording (launches Browsertrix) |
-| `POST` | `/entry/<id>/stop` | Stop recording, copy WACZ, save path to DB |
-| `GET` | `/entry/<id>/replay` | Redirect to ReplayWeb.page with local WACZ as source |
-| `POST` | `/entry/<id>/delete` | Delete entry and its local WACZ file |
+| `POST` | `/entry/<id>/start` | Start interactive recording (creates crawl_run, launches Browsertrix) |
+| `POST` | `/entry/<id>/stop` | Stop recording, copy WACZ, insert archive_file row, set status to archived |
+| `GET` | `/entry/<id>/replay` | Redirect to ReplayWeb.page using the latest archive_file |
+| `POST` | `/entry/<id>/delete` | Delete entry, its archive files from disk, and all related DB rows |
 | `GET` | `/archives/<path>` | Serve WACZ files with CORS and HTTP Range support |
 
 ---
@@ -123,30 +123,51 @@ http://localhost:18080/
 
 The application automatically creates and migrates the SQLite schema at every startup.
 The current schema version is stored in `schema_version` and is incremented after each successful migration.
+The complete schema reference is in `sql/schema.sql`.
+
+### Core tables
 
 ```sql
--- Always contains exactly one row.
-CREATE TABLE schema_version (
-    version INTEGER NOT NULL
-);
-
 CREATE TABLE collection (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL UNIQUE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE entry (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     collection_id  INTEGER NOT NULL,
     url            TEXT NOT NULL,
+    normalized_url TEXT,
     title          TEXT,
+    status         TEXT NOT NULL DEFAULT 'new',
+    note           TEXT,
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    archived_at    DATETIME,
+    last_error     TEXT,
+    -- legacy columns kept for backward compatibility:
     warc_path      TEXT,
     browsertrix_id TEXT,
-    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (collection_id) REFERENCES collection(id) ON DELETE CASCADE
 );
 ```
+
+### New tables (schema version 2)
+
+**`archive_file`** — one or more WACZ/WARC files per entry.
+New code reads the latest archive via `getLatestArchiveFile(entryId)`; `entry.warc_path` is kept for backward compatibility.
+
+**`crawl_run`** — one row per crawl attempt.
+Stores Browsertrix ID, Docker container name, status (`created` → `running` → `stopped`/`finished`/`failed`), timestamps, exit code, and error message.
+
+**`capture_metadata`** — optional metadata collected per crawl (final URL, HTTP status, content type, screenshot path, page title).
+
+**`tag`** + **`entry_tag`** — many-to-many tag support for entries.
+
+**`entry_note`** — timestamped note history per entry.
 
 ### Schema versioning and migrations
 
@@ -154,8 +175,9 @@ Versioning is managed entirely inside `Database.cpp`:
 
 - `kCurrentSchemaVersion` — compile-time constant; bump this when adding new migrations.
 - `kMigrations[]` — array of SQL strings, one element per version step (`kMigrations[N]` migrates from version `N` to `N+1`).
-- On **first run** (fresh DB): all migrations are executed in a single transaction and the version is set to `kCurrentSchemaVersion`.
-- On **subsequent runs**: the version stored in `schema_version` is compared to `kCurrentSchemaVersion`; any missing migrations are applied in order, each wrapped in a transaction.
+- On **first run** (fresh DB): all migrations are executed in a single transaction.
+- On **subsequent runs**: only missing migrations are applied in order, each in its own transaction.
+- Migration v1→v2 copies existing `entry.warc_path` values into `archive_file` and `entry.browsertrix_id` into `crawl_run`.
 
 To add a new migration:
 
@@ -169,7 +191,7 @@ To add a new migration:
 
 `BrowsertrixService` uses the Docker CLI to start and stop Browsertrix Crawler containers.
 
-- `startRecording()` runs `docker run` with a deterministic crawl ID derived from the entry ID.
+- `startRecording()` runs `docker run` with a deterministic crawl ID derived from the entry ID, and returns the `browsertrixId` and `dockerContainerName` used.
 - `stopRecording()` runs `docker stop`, then locates the generated WACZ in the crawls directory and copies it to `data/archives/<collectionId>/<entryId>.wacz`.
 
 This is the intended **extension point**. If you want to use a long-running Browsertrix service or a custom recording API, replace only `startRecording()` and `stopRecording()` — the database, UI, file serving, and replay routes remain unchanged.
@@ -186,7 +208,7 @@ Crow serves WACZ files as static HTTP content (with Range support), making them 
 http://localhost:18080/archives/<collectionId>/<entryId>.wacz
 ```
 
-The `/entry/<id>/replay` route builds the full replay URL:
+The `/entry/<id>/replay` route reads the latest `archive_file` for the entry and builds the full replay URL:
 
 ```
 https://replayweb.page/?source=http://localhost:18080/archives/<collectionId>/<entryId>.wacz

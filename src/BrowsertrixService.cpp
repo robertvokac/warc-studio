@@ -35,6 +35,7 @@ RecordingStartResult BrowsertrixService::startRecording(const Entry& entry) cons
     if (!runBrowsertrix_) {
         return RecordingStartResult{
             .browsertrixId = browsertrixId,
+            .dockerContainerName = {},
             .message = "Recording metadata was created. Browsertrix execution is disabled by configuration."
         };
     }
@@ -58,6 +59,7 @@ RecordingStartResult BrowsertrixService::startRecording(const Entry& entry) cons
 
     return RecordingStartResult{
         .browsertrixId = browsertrixId,
+        .dockerContainerName = containerName(browsertrixId),
         .message = "Browsertrix container was started. Stop the recording when the crawl is complete."
     };
 }
