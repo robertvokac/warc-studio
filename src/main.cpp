@@ -209,21 +209,87 @@ int main() {
             }
         );
 
-        // /replay/sw.js — service worker required by ReplayWeb.page web component.
-        // Scope /replay/ means the SW can intercept archive requests within that namespace.
-        // The SW itself just delegates to the CDN; only this tiny stub needs to be local.
-        // /sw.js kept for backward compatibility with any cached service worker registrations.
-        CROW_ROUTE(app, "/sw.js")([] {
-            crow::response res(200, "importScripts('https://cdn.jsdelivr.net/npm/replaywebpage@2.4.6/sw.js');");
-            res.add_header("Content-Type", "application/javascript");
-            return res;
-        });
+        // ReplayWeb.page assets — served locally from static/ so that both
+        // the JS bundle and the WACZ fetches originate from the same HTTP origin,
+        // avoiding mixed-content blocks.  ui.js and sw.js are vendored from
+        // replaywebpage@2.4.6 and copied to the build static/ directory.
+        //
+        // Routes:
+        //   /replay/ui.js  — primary path; replayBase="/replay/" causes the
+        //                    web component to compute this URL automatically.
+        //   /replay/sw.js  — service worker with scope /replay/.
+        //   /static/ui.js  — alternate path kept for backward compatibility.
+        //   /static/sw.js  — alternate path kept for backward compatibility.
+        //   /sw.js         — root-scope SW kept for any old cached registrations.
+        CROW_ROUTE(app, "/replay/ui.js")(
+            [&staticRoot]() {
+                auto res = serveStaticFile("ui.js", "application/javascript; charset=utf-8", staticRoot);
+                res.add_header("Cache-Control", "no-store");
+                return res;
+            }
+        );
 
-        CROW_ROUTE(app, "/replay/sw.js")([] {
-            crow::response res(200, "importScripts('https://cdn.jsdelivr.net/npm/replaywebpage@2.4.6/sw.js');");
-            res.add_header("Content-Type", "application/javascript");
+        CROW_ROUTE(app, "/replay/sw.js")(
+            [&staticRoot]() {
+                auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
+                res.add_header("Cache-Control", "no-store");
+                return res;
+            }
+        );
+
+        CROW_ROUTE(app, "/static/ui.js")(
+            [&staticRoot]() {
+                auto res = serveStaticFile("ui.js", "application/javascript; charset=utf-8", staticRoot);
+                res.add_header("Cache-Control", "no-store");
+                return res;
+            }
+        );
+
+        CROW_ROUTE(app, "/static/sw.js")(
+            [&staticRoot]() {
+                auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
+                res.add_header("Cache-Control", "no-store");
+                return res;
+            }
+        );
+
+        // /replay/ and /replay — app shell required by ReplayWeb.page service worker.
+        // When the SW intercepts /replay/?source=... on first load, the browser may
+        // fall through to the server. Crow must return a valid HTML page (not 404).
+        auto replayShellHandler = [](const crow::request& req) {
+            std::string query = req.raw_url;
+            std::cerr << "REPLAY SHELL REQUEST:\n"
+                      << "  path = " << req.url << "\n"
+                      << "  query = " << query << "\n";
+            const std::string html =
+                "<!doctype html>\n"
+                "<html>\n"
+                "<head>\n"
+                "  <meta charset=\"utf-8\">\n"
+                "  <title>warc-studio replay shell</title>\n"
+                "  <script src=\"/replay/ui.js\"></script>\n"
+                "</head>\n"
+                "<body>\n"
+                "  <replay-app-main></replay-app-main>\n"
+                "</body>\n"
+                "</html>\n";
+            crow::response res(200, html);
+            res.add_header("Content-Type", "text/html; charset=utf-8");
+            res.add_header("Cache-Control", "no-store");
             return res;
-        });
+        };
+        // Crow treats /replay and /replay/ as the same route — register only one.
+        // The browser requests /replay/?source=... (with trailing slash).
+        CROW_ROUTE(app, "/replay/")(replayShellHandler);
+
+        // /sw.js — root-scope backward-compat: serves same local sw.js file.
+        CROW_ROUTE(app, "/sw.js")(
+            [&staticRoot]() {
+                auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
+                res.add_header("Cache-Control", "no-store");
+                return res;
+            }
+        );
 
         // -----------------------------------------------------------------------
         // Root / legacy index page
@@ -534,6 +600,70 @@ int main() {
             }
         );
 
+        // GET /entry/<id>/check — check if Browsertrix container finished; auto-stop if done
+        CROW_ROUTE(app, "/entry/<int>/check")(
+            [&database, &browsertrix, &fileService](const crow::request& /*req*/, int entryId) {
+                try {
+                    const auto entry = database.getEntry(entryId);
+                    if (!entry) {
+                        return redirectWithMessage("Entry was not found.");
+                    }
+
+                    if (entry->status != "recording") {
+                        return redirectWithMessageTo(
+                            "/entry/" + std::to_string(entryId),
+                            "Entry is not currently recording (status: " + entry->status + ").");
+                    }
+
+                    const std::string browsertrixId = entry->browsertrixId.value_or(
+                        "crawl_entry_" + std::to_string(entry->id));
+
+                    if (!browsertrix.isContainerFinished(browsertrixId)) {
+                        return redirectWithMessageTo(
+                            "/entry/" + std::to_string(entryId),
+                            "Browsertrix container is still running. Check again later.");
+                    }
+
+                    // Container finished — run the same stop logic as POST /entry/<id>/stop.
+                    const auto activeCrawlRun = database.getLatestActiveCrawlRunForEntry(entryId);
+                    const auto result = browsertrix.stopRecording(*entry);
+
+                    if (!result.storedWaczPath.empty()) {
+                        const std::string sha256 = fileService.computeSha256(result.storedWaczPath);
+                        database.addArchiveFile(
+                            entryId, result.storedWaczPath, "wacz",
+                            std::string{"browsertrix recording"},
+                            std::string{"browsertrix"},
+                            std::nullopt,
+                            sha256.empty() ? std::optional<std::string>{}
+                                           : std::optional<std::string>{sha256}
+                        );
+                        database.markEntryArchived(entryId);
+                        database.setEntryWarcPath(entryId, result.storedWaczPath);
+                    }
+
+                    if (activeCrawlRun) {
+                        database.updateCrawlRunStopped(activeCrawlRun->id, "finished",
+                                                       std::optional<int>{0}, std::nullopt);
+                    }
+
+                    return redirectWithMessageTo(
+                        "/entry/" + std::to_string(entryId),
+                        "Crawl completed. " + result.message);
+                } catch (const std::exception& error) {
+                    database.setEntryError(entryId, error.what());
+                    const auto activeCrawlRun = database.getLatestActiveCrawlRunForEntry(entryId);
+                    if (activeCrawlRun) {
+                        database.updateCrawlRunStopped(activeCrawlRun->id, "failed",
+                                                       std::nullopt, std::string{error.what()});
+                    }
+                    return redirectWithMessageTo(
+                        "/entry/" + std::to_string(entryId),
+                        std::string("Error: ") + error.what());
+                }
+            }
+        );
+
         // POST /entry/<id>/upload — upload a WARC/WACZ file
         CROW_ROUTE(app, "/entry/<int>/upload").methods(crow::HTTPMethod::POST)(
             [&database, &fileService](const crow::request& request, int entryId) {
@@ -732,9 +862,8 @@ int main() {
                          << warc_studio::htmlEscape(archiveFile->label.value_or(archiveFile->path))
                          << " — warc-studio</title>\n";
                     html << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n";
-                    // ui.js from CDN — loading HTTPS script into HTTP page is allowed.
-                    html << "<script src=\"https://cdn.jsdelivr.net/npm/replaywebpage@2.4.6/ui.js\""
-                         << " crossorigin=\"anonymous\"></script>\n";
+                    // ui.js served locally from /replay/ui.js (consistent with replayBase="/replay/").
+                    html << "<script src=\"/replay/ui.js\"></script>\n";
                     html << "<style>\n"
                          << "html,body{margin:0;padding:0;width:100%;height:100%;}\n"
                          << "replay-web-page{display:block;width:100%;height:100vh;}\n"

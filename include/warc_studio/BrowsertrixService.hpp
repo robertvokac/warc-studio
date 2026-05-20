@@ -27,6 +27,10 @@ public:
     RecordingStartResult startRecording(const Entry& entry) const;
     RecordingStopResult stopRecording(const Entry& entry) const;
 
+    // Returns true when the Docker container has exited (status "exited" or missing).
+    // Returns false when Browsertrix is disabled or the container is still running.
+    [[nodiscard]] bool isContainerFinished(const std::string& browsertrixId) const;
+
 private:
     FileService fileService_;
     std::string image_;

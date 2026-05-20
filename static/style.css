@@ -356,6 +356,37 @@ tr:hover td {
     margin-bottom: 0.25rem;
 }
 
+/* Recording in progress notice */
+.recording-notice {
+    color: #b45309;
+    background: #fef3c7;
+    border: 1px solid #fcd34d;
+    border-radius: 0.35rem;
+    padding: 0.5rem 0.8rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+}
+/* Generic btn anchor-as-button — mirrors button styles */
+a.btn {
+    display: inline-block;
+    padding: 0.4rem 0.9rem;
+    border-radius: 0.35rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    border: 1px solid transparent;
+    background: var(--color-bg-card);
+    color: var(--color-text);
+    border-color: var(--color-border);
+}
+a.btn:hover {
+    background: #e5e7eb;
+}
+a.btn.btn-secondary {
+    background: var(--color-bg-card);
+    color: var(--color-text);
+}
 /* Entry number display */
 .num-badge {
     display: inline-block;

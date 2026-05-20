@@ -363,6 +363,31 @@ std::string renderEntryDetailPage(
                       + " — " + entry.collectionName, "entries");
     renderMessage(html, message);
 
+    // Auto-refresh every 20 seconds when a crawl is in progress so the user
+    // sees the status change to "archived" without manually reloading.
+    if (entry.status == "recording") {
+        html << "<script>\n";
+        html << "(function() {\n";
+        html << "  var CHECK_URL = '/entry/" << entry.id << "/check';\n";
+        html << "  var INTERVAL_MS = 20000;\n";
+        html << "  function poll() {\n";
+        html << "    fetch(CHECK_URL, {method:'GET', redirect:'follow'})\n";
+        html << "      .then(function(r) { if (r.ok || r.redirected) window.location.reload(); })\n";
+        html << "      .catch(function() {});\n";
+        html << "  }\n";
+        html << "  var timer = setInterval(function() {\n";
+        html << "    fetch('/entry/" << entry.id << "', {method:'GET'})\n";
+        html << "      .then(function(r) { return r.text(); })\n";
+        html << "      .then(function(body) {\n";
+        html << "        if (body.indexOf('status-recording') === -1) { clearInterval(timer); window.location.reload(); return; }\n";
+        html << "        poll();\n";
+        html << "      })\n";
+        html << "      .catch(function() {});\n";
+        html << "  }, INTERVAL_MS);\n";
+        html << "})();\n";
+        html << "</script>\n";
+    }
+
     html << "<div class=\"page-title\">\n";
     html << "<p class=\"muted\"><a href=\"/collections/" << entry.collectionId
          << "/entries\">&#8592; " << htmlEscape(entry.collectionName) << "</a></p>\n";
@@ -429,11 +454,16 @@ std::string renderEntryDetailPage(
 
     // Browsertrix recording actions
     html << "<div class=\"card\">\n<h2>Browsertrix recording</h2>\n";
+    if (entry.status == "recording") {
+        html << "<p class=\"recording-notice\">&#9679; Crawl is running in the background. "
+             << "The page auto-checks every 20&nbsp;s and will reload when the crawl finishes.</p>\n";
+    }
     html << "<div class=\"inline-row\">\n";
     html << "<form method=\"post\" action=\"/entry/" << entry.id << "/start\">"
          << "<button type=\"submit\">Start recording</button></form>\n";
+    html << "<a href=\"/entry/" << entry.id << "/check\" class=\"btn btn-secondary\">Check / auto-stop if done</a>\n";
     html << "<form method=\"post\" action=\"/entry/" << entry.id << "/stop\">"
-         << "<button class=\"btn-secondary\" type=\"submit\">Stop recording</button></form>\n";
+         << "<button class=\"btn-secondary\" type=\"submit\">Stop recording (force)</button></form>\n";
     html << "</div>\n</div>\n";
 
     // Archive files
@@ -657,7 +687,9 @@ std::string renderReplayPage(const std::string& sourceUrl, const std::string& ti
     // HTTPS→HTTP mixed-content block that occurs when loading ui.js from CDN.
     // The service worker is at /replay/sw.js with scope /replay/ (as recommended
     // by the ReplayWeb.page documentation for self-hosted deployments).
-    html << "<script src=\"/static/ui.js\"></script>\n";
+    // Load ui.js from /replay/ui.js — same path prefix as replayBase="/replay/"
+    // so the web component resolves all sub-resources (including sw.js) consistently.
+    html << "<script src=\"/replay/ui.js\"></script>\n";
     html << "</head>\n<body>\n";
     html << "<div class=\"topbar\">\n";
     html << "  <a href=\"/\">&#8592; warc-studio</a>\n";

@@ -183,6 +183,28 @@ std::filesystem::path BrowsertrixService::findGeneratedWacz(const std::string& b
     throw std::runtime_error("No WACZ file was found for Browsertrix ID: " + browsertrixId);
 }
 
+bool BrowsertrixService::isContainerFinished(const std::string& browsertrixId) const {
+    if (!runBrowsertrix_) {
+        return false;
+    }
+    // Query Docker for the container state. Returns "running", "exited", "created", etc.
+    // If the container does not exist, docker inspect returns a non-zero exit code and no output.
+    // HACK: sg docker wrapper — remove once user is permanently in docker group.
+    const std::string cmd = std::format(
+        "sg docker -c 'docker inspect --format \"{{{{.State.Status}}}}\" {} 2>/dev/null || true'",
+        containerName(browsertrixId)
+    );
+    const std::string output = runShellCommandWithOutput(cmd);
+    // Trim whitespace.
+    std::string state = output;
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' ')) {
+        state.pop_back();
+    }
+    // If output is empty, the container does not exist (already removed or never started).
+    // "exited" means the crawl finished. Either way, we can proceed with stop logic.
+    return state.empty() || state == "exited";
+}
+
 RecordingStopResult BrowsertrixService::stopRecording(const Entry& entry) const {
     const std::string browsertrixId = entry.browsertrixId.value_or(makeBrowsertrixId(entry.id));
 

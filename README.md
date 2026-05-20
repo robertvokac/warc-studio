@@ -161,7 +161,8 @@ Migrations are applied automatically at startup. See `sql/schema.sql` for the fu
 - WACZ files are replayed via an embedded [ReplayWeb.page](https://replayweb.page/) player served locally.
 - WARC files (`.warc`, `.warc.gz`) are stored but replay is not supported yet; a clear message is shown.
 - The ReplayWeb.page `ui.js` and `sw.js` bundles are vendored in `static/` so no CDN is required and there is no mixed-content issue.
-- The service worker is served at `/replay/sw.js` with scope `/replay/` (as recommended by ReplayWeb.page documentation for self-hosted deployments).
+- All replay assets are served locally: `/replay/ui.js` (UI bundle), `/replay/sw.js` (service worker with scope `/replay/`).
+- The script tag on the replay page uses `/replay/ui.js` which is consistent with `replayBase="/replay/"`, so the web component resolves all sub-resources from the same local path prefix.
 
 ### Replay troubleshooting
 
@@ -169,7 +170,7 @@ Migrations are applied automatically at startup. See `sql/schema.sql` for the fu
 
 1. Verify the WACZ file downloads correctly: `curl -o /tmp/test.wacz http://localhost:18080/archives/<path>`
 2. Verify CORS and Range headers: `curl -I -H "Range: bytes=0-1023" http://localhost:18080/archives/<path>` — expect `206 Partial Content` with `Access-Control-Allow-Origin: *`
-3. If you upgraded the app, clear the browser's service worker cache: DevTools → Application → Service Workers → Unregister, then reload.
+3. **Clear stale service worker**: DevTools → Application → Service Workers → Unregister all service workers for `localhost`, then hard refresh (Ctrl+Shift+R / Cmd+Shift+R). Old cached service workers with wrong scope may prevent replay from loading.
 4. Try an incognito/private window to avoid stale service worker state.
 5. WARC replay is not supported — only WACZ files can be replayed.
 
@@ -201,9 +202,11 @@ POST /collection/<id>/delete         — Delete collection
 GET  /archives-browser               — Archive files browser
 GET  /about                          — Settings / About
 GET  /archives/<path>                — Serve archive files (CORS-enabled, Range support)
+GET  /replay/ui.js                   — ReplayWeb.page UI bundle (self-hosted, local)
 GET  /replay/sw.js                   — ReplayWeb.page service worker (scope /replay/)
+GET  /static/ui.js                   — ReplayWeb.page UI bundle (alternate path)
+GET  /static/sw.js                   — ReplayWeb.page service worker (alternate path)
 GET  /sw.js                          — ReplayWeb.page service worker (root scope, for compatibility)
-GET  /static/ui.js                   — ReplayWeb.page UI bundle (self-hosted)
 GET  /static/style.css               — Application CSS
 GET  /favicon.svg                    — Favicon
 GET  /health                         — Health check
