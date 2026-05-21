@@ -9,11 +9,21 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#elif defined(__APPLE__)
+#  include <mach-o/dyld.h>
+#else
+#  include <unistd.h>
+#endif
 #include <iostream>
 #include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 // Application version string
 static constexpr const char* kAppVersion = "0.2.0";
@@ -69,6 +79,78 @@ std::uint16_t environmentPortOrDefault(const char* name, std::uint16_t fallback)
         return fallback;
     }
     return static_cast<std::uint16_t>(std::stoi(value));
+}
+
+
+std::optional<std::filesystem::path> executableDirectory() {
+#if defined(_WIN32)
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (size == 0) {
+            return std::nullopt;
+        }
+        if (size < buffer.size() - 1) {
+            buffer.resize(size);
+            return std::filesystem::path(buffer).parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#elif defined(__APPLE__)
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buffer(size, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        return std::nullopt;
+    }
+    buffer.resize(std::char_traits<char>::length(buffer.c_str()));
+    std::error_code ec;
+    const auto canonical = std::filesystem::weakly_canonical(buffer, ec);
+    return (ec ? std::filesystem::path(buffer) : canonical).parent_path();
+#else
+    std::string buffer(4096, '\0');
+    for (;;) {
+        const ssize_t size = ::readlink("/proc/self/exe", buffer.data(), buffer.size());
+        if (size < 0) {
+            return std::nullopt;
+        }
+        if (static_cast<std::size_t>(size) < buffer.size()) {
+            buffer.resize(static_cast<std::size_t>(size));
+            return std::filesystem::path(buffer).parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#endif
+}
+
+std::filesystem::path findStaticRoot() {
+    if (const char* value = std::getenv("WARC_STUDIO_STATIC_DIR"); value != nullptr && std::string(value).empty() == false) {
+        const auto explicitRoot = std::filesystem::weakly_canonical(std::filesystem::path(value));
+        if (!std::filesystem::is_directory(explicitRoot)) {
+            throw std::runtime_error("WARC_STUDIO_STATIC_DIR does not point to a directory: " + explicitRoot.string());
+        }
+        return explicitRoot;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    if (const auto exeDir = executableDirectory()) {
+        candidates.push_back(*exeDir / "static");
+        candidates.push_back(*exeDir / ".." / "share" / "warc-studio" / "static");
+    }
+    candidates.push_back(std::filesystem::current_path() / "static");
+
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        const auto canonical = std::filesystem::weakly_canonical(candidate, ec);
+        if (!ec && std::filesystem::is_directory(canonical)) {
+            return canonical;
+        }
+    }
+
+    throw std::runtime_error(
+        "Could not find static assets. Expected static/ next to the executable, "
+        "or set WARC_STUDIO_STATIC_DIR."
+    );
 }
 
 crow::response htmlResponse(const std::string& body) {
@@ -179,10 +261,10 @@ int main() {
             ? true
             : warc_studio::isTruthyEnvironmentValue(runBrowsertrixEnv);
 
-        // Static files root: look for the static/ directory next to the binary and in the CWD.
-        const auto staticRoot = std::filesystem::weakly_canonical(
-            std::filesystem::current_path() / "static"
-        );
+        // Static files root: prefer static/ next to the executable, with an explicit
+        // WARC_STUDIO_STATIC_DIR override and a CWD fallback for development runs.
+        const auto staticRoot = findStaticRoot();
+        std::cout << "Static assets root: " << staticRoot << "\n";
 
         warc_studio::Database database(dataRoot / "warc-studio.sqlite3");
         warc_studio::FileService fileService(dataRoot);

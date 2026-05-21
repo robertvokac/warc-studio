@@ -17,6 +17,7 @@ CREATE TABLE schema_version (
 --         capture_metadata, tag, entry_tag, entry_note; data migration from warc_path/browsertrix_id
 --   3 — per-collection entry numbering (number_per_collection on entry);
 --         label and source columns on archive_file
+--   4 — unique URL per collection: UNIQUE INDEX on (collection_id, url) in entry
 
 -- ---------------------------------------------------------------------------
 -- Core tables
@@ -52,6 +53,8 @@ CREATE TABLE entry (
     FOREIGN KEY (collection_id) REFERENCES collection(id) ON DELETE CASCADE,
     UNIQUE (collection_id, number_per_collection)
 );
+
+CREATE UNIQUE INDEX entry_collection_url_unique ON entry (collection_id, url);
 
 -- ---------------------------------------------------------------------------
 -- Archive files — one or more WACZ/WARC files per entry

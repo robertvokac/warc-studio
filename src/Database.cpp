@@ -243,7 +243,7 @@ void Database::execute(const char* sql) const {
 // ---------------------------------------------------------------------------
 
 // Bump this constant and append to kMigrations when adding new schema changes.
-static constexpr int kCurrentSchemaVersion = 3;
+static constexpr int kCurrentSchemaVersion = 4;
 
 // kMigrations[N] migrates the database from version N to version N+1.
 static const char* kMigrations[] = {
@@ -368,6 +368,13 @@ static const char* kMigrations[] = {
 
         ALTER TABLE archive_file ADD COLUMN label TEXT;
         ALTER TABLE archive_file ADD COLUMN source TEXT NOT NULL DEFAULT 'browsertrix';
+    )SQL",
+
+    // v3 → v4 : unique URL per collection
+    //   - create a unique index on (collection_id, url) in entry
+    R"SQL(
+        CREATE UNIQUE INDEX IF NOT EXISTS entry_collection_url_unique
+            ON entry (collection_id, url);
     )SQL",
 };
 
@@ -649,6 +656,19 @@ int Database::createEntry(int collectionId, const std::string& url, const std::o
     // Use a transaction to atomically assign number_per_collection.
     execute("BEGIN;");
     try {
+        // Check for duplicate URL within the same collection.
+        {
+            Statement check(db_,
+                "SELECT id FROM entry WHERE collection_id = ? AND url = ? LIMIT 1;");
+            check.bindInt(1, collectionId);
+            check.bindText(2, url);
+            if (sqlite3_step(check.get()) == SQLITE_ROW) {
+                execute("ROLLBACK;");
+                throw std::runtime_error(
+                    "An entry with this URL already exists in the collection.");
+            }
+        }
+
         const int nextNumber = getNextEntryNumberForCollection(collectionId);
         Statement stmt(db_,
             "INSERT INTO entry (collection_id, url, title, number_per_collection) VALUES (?, ?, ?, ?);");
@@ -760,6 +780,21 @@ void Database::markEntryImportedIfNew(int entryId) {
 }
 
 void Database::updateEntry(int entryId, const std::string& url, const std::string& title, const std::string& note) {
+    // Check for duplicate URL within the same collection (excluding the entry being updated).
+    {
+        Statement check(db_,
+            "SELECT id FROM entry WHERE collection_id = "
+            "  (SELECT collection_id FROM entry WHERE id = ?) "
+            "AND url = ? AND id != ? LIMIT 1;");
+        check.bindInt(1, entryId);
+        check.bindText(2, url);
+        check.bindInt(3, entryId);
+        if (sqlite3_step(check.get()) == SQLITE_ROW) {
+            throw std::runtime_error(
+                "An entry with this URL already exists in the collection.");
+        }
+    }
+
     Statement stmt(db_,
         "UPDATE entry SET url = ?, title = ?, note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;");
     stmt.bindText(1, url);
