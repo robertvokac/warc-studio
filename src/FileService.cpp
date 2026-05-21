@@ -114,9 +114,6 @@ crow::response FileService::serveArchive(const crow::request& request, const std
               << "  Origin  = " << request.get_header_value("Origin") << "\n"
               << "  PNA     = " << request.get_header_value("Access-Control-Request-Private-Network") << "\n";
 
-    // Handle HEAD — same headers as GET but no body.
-    const bool isHead = (request.method == crow::HTTPMethod::Head);
-
     try {
         const auto path = safeArchivePath(relativePath);
         if (!std::filesystem::is_regular_file(path)) {
@@ -169,7 +166,7 @@ crow::response FileService::serveArchive(const crow::request& request, const std
                   << (partial ? (" Content-Range: bytes " + std::to_string(start) + "-"
                                  + std::to_string(end) + "/" + std::to_string(fileSize)) : "")
                   << "\n";
-        crow::response response(status, isHead ? "" : readBytes(path, start, length));
+        crow::response response(status, readBytes(path, start, length));
         addArchiveHeaders(response);
         response.add_header("Content-Length", std::to_string(length));
         if (partial) {

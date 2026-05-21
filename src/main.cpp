@@ -282,6 +282,17 @@ int main() {
         // The browser requests /replay/?source=... (with trailing slash).
         CROW_ROUTE(app, "/replay/")(replayShellHandler);
 
+        // Catch-all for /replay/<path> sub-paths (e.g. /replay/w/<ts>/<url>).
+        // ReplayWeb.page uses internal navigation paths under /replay/ that are
+        // normally intercepted by the service worker. On first load (before the SW
+        // is installed/active), these requests fall through to the server.
+        // Returning the shell HTML allows the SW to register and take over.
+        CROW_ROUTE(app, "/replay/<path>")(
+            [replayShellHandler](const crow::request& req, const std::string& /*subPath*/) {
+                return replayShellHandler(req);
+            }
+        );
+
         // /sw.js — root-scope backward-compat: serves same local sw.js file.
         CROW_ROUTE(app, "/sw.js")(
             [&staticRoot]() {
@@ -825,13 +836,14 @@ int main() {
         );
 
         // GET /archive/<id>/replay — replay a specific archive file.
-        // Renders a local HTML page that embeds the ReplayWeb.page web component.
-        // The WACZ source is a same-origin relative URL (/archives/...) so there is
-        // no mixed-content issue regardless of whether the app runs on HTTP or HTTPS.
-        // ui.js is loaded from CDN (HTTPS → HTTP is fine for scripts).
-        // The service worker at /replay/sw.js delegates to the CDN sw.js and has scope /replay/.
+        // Serves an inline HTML page with the <replay-web-page> web component.
+        // The WACZ source is a same-origin relative URL (/archives/...) — no mixed-content,
+        // no cross-origin issues, no redirect to external paths.
+        // replayBase="/replay/" tells the component to load its SW from /replay/sw.js;
+        // in embed="default" mode the actual replay runs inside an iframe rooted at /replay/
+        // so the SW scope /replay/ covers it correctly even though this page is at /archive/<id>/replay.
         CROW_ROUTE(app, "/archive/<int>/replay")(
-            [&database, &fileService](int archiveFileId) {
+            [&database, &fileService](const crow::request& request, int archiveFileId) {
                 try {
                     const auto archiveFile = database.getArchiveFileById(archiveFileId);
                     if (!archiveFile) {
@@ -843,17 +855,33 @@ int main() {
                             "Only WACZ files can be replayed.</p></body></html>");
                     }
 
-                    // Same-origin relative URL — no cross-origin or mixed-content issues.
-                    const std::string relativeSource =
+                    // Relative same-origin source path for the WACZ file.
+                    // Must NOT be a localhost absolute URL — keep it relative so it works
+                    // regardless of the host/port the app runs on.
+                    const std::string waczSource =
                         fileService.publicArchivePath(archiveFile->path);
-                    const std::string externalUrl =
-                        "https://replayweb.page/?source=http%3A%2F%2Flocalhost%2F"
-                        + warc_studio::urlEncode(relativeSource);
 
+                    // Determine the original archived URL to replay.
+                    // Priority: explicit ?url= query param → entry seed URL from DB → none (show index).
+                    // The url attribute must be the ORIGINAL archived URL (e.g. https://example.com/),
+                    // never a local application path like /archives/... or http://localhost/...
+                    std::string replayUrl;
+                    const char* urlParam = request.url_params.get("url");
+                    if (urlParam != nullptr && std::string(urlParam) != "") {
+                        replayUrl = std::string(urlParam);
+                    }
+
+                    // Logging: print all relevant info to stdout for diagnostics.
                     std::cout << "REPLAY DEBUG:\n"
+                              << "  archiveId       = " << archiveFileId << "\n"
                               << "  archive_file.id = " << archiveFile->id << "\n"
                               << "  archive_file.path = " << archiveFile->path << "\n"
-                              << "  relative_source = " << relativeSource << "\n";
+                              << "  wacz_source     = " << waczSource << "  (relative same-origin path)\n"
+                              << "  replay_url      = " << (replayUrl.empty() ? "(none — will show pages index)" : replayUrl) << "\n"
+                              << std::flush;
+                    if (replayUrl.empty()) {
+                        std::cout << "  replay_url      = (none, url attribute omitted, ReplayWeb.page should show WACZ index)\n";
+                    }
 
                     std::ostringstream html;
                     html << "<!doctype html>\n<html lang=\"en\">\n<head>\n";
@@ -862,14 +890,15 @@ int main() {
                          << warc_studio::htmlEscape(archiveFile->label.value_or(archiveFile->path))
                          << " — warc-studio</title>\n";
                     html << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n";
-                    // ui.js served locally from /replay/ui.js (consistent with replayBase="/replay/").
+                    // ui.js is loaded from /replay/ui.js — same path as replayBase so SW registration works.
                     html << "<script src=\"/replay/ui.js\"></script>\n";
                     html << "<style>\n"
                          << "html,body{margin:0;padding:0;width:100%;height:100%;}\n"
                          << "replay-web-page{display:block;width:100%;height:100vh;}\n"
                          << ".replay-bar{background:#1a1a2e;color:#eee;padding:6px 12px;"
-                         << "font-family:sans-serif;font-size:13px;display:flex;gap:12px;align-items:center;}\n"
+                         << "font-family:sans-serif;font-size:13px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;}\n"
                          << ".replay-bar a{color:#90caf9;text-decoration:none;}\n"
+                         << ".replay-bar .replay-url{color:#aed6a0;word-break:break-all;}\n"
                          << "</style>\n";
                     html << "</head>\n<body>\n";
                     html << "<div class=\"replay-bar\">\n";
@@ -877,22 +906,132 @@ int main() {
                     html << "<span>Replaying: "
                          << warc_studio::htmlEscape(archiveFile->label.value_or(archiveFile->path))
                          << "</span>\n";
-                    html << "<a href=\"" << warc_studio::htmlEscape(relativeSource)
+                    if (!replayUrl.empty()) {
+                        html << "<span class=\"replay-url\">URL: "
+                             << warc_studio::htmlEscape(replayUrl) << "</span>\n";
+                    }
+                    html << "<a href=\"" << warc_studio::htmlEscape(waczSource)
                          << "\" download>&#11015; Download WACZ</a>\n";
-                    html << "<!-- archive_file.id=" << archiveFile->id
-                         << " path=" << warc_studio::htmlEscape(archiveFile->path)
-                         << " source=" << warc_studio::htmlEscape(relativeSource) << " -->\n";
+                    html << "<a href=\"/archive/" << archiveFileId << "/debug/wacz\" style=\"color:#ffeb3b\">[Debug WACZ]</a>\n";
+                    // HTML comment with diagnostic info.
+                    html << "<!-- REPLAY: archive_file.id=" << archiveFile->id
+                         << " wacz_source=" << warc_studio::htmlEscape(waczSource)
+                         << " replay_url=" << warc_studio::htmlEscape(replayUrl) << " -->\n";
                     html << "</div>\n";
-                    // replayBase=/replay/ → SW registered at /replay/sw.js with scope /replay/
+                    // <replay-web-page> web component:
+                    // - source: relative path to WACZ (same-origin, no mixed-content)
+                    // - url: original archived URL (from DB or query param); omit to show pages index
+                    // - replayBase: where to find ui.js and sw.js (must match where SW is served)
+                    // - embed="default": renders inside an iframe scoped to replayBase — SW scope covers it
                     html << "<replay-web-page\n"
-                         << "  source=\"" << warc_studio::htmlEscape(relativeSource) << "\"\n"
-                         << "  replayBase=\"/replay/\"\n"
+                         << "  source=\"" << warc_studio::htmlEscape(waczSource) << "\"\n";
+                    if (!replayUrl.empty()) {
+                        html << "  url=\"" << warc_studio::htmlEscape(replayUrl) << "\"\n";
+                    }
+                    html << "  replayBase=\"/replay/\"\n"
                          << "  embed=\"default\">\n"
                          << "</replay-web-page>\n";
                     html << "</body>\n</html>\n";
                     return htmlResponse(html.str());
                 } catch (const std::exception& error) {
                     return crow::response(500, error.what());
+                }
+            }
+        );
+
+        // GET /archive/<id>/debug/wacz — diagnostic endpoint for WACZ files.
+        CROW_ROUTE(app, "/archive/<int>/debug/wacz")(
+            [&database, &fileService](const crow::request&, int archiveFileId) {
+                try {
+                    const auto af = database.getArchiveFileById(archiveFileId);
+                    if (!af) return crow::response(404, "Archive file not found");
+
+                    std::ostringstream out;
+                    out << "<html><head><title>Debug WACZ: " << archiveFileId << "</title>";
+                    out << "<style>body{font-family:monospace;white-space:pre;padding:20px;background:#1e1e1e;color:#d4d4d4;}";
+                    out << "h1{color:#569cd6;} h2{color:#ce9178;margin-top:2em; border-bottom:1px solid #333;}";
+                    out << ".ok{color:#4ec9b0;} .err{color:#f44747;}</style></head><body>";
+                    out << "<h1>Debug WACZ: " << archiveFileId << "</h1>";
+
+                    // 1. Database Record
+                    out << "<h2>1. Database Record (archive_file)</h2>";
+                    out << "ID:         " << af->id << "\n";
+                    out << "Entry ID:   " << af->entryId << "\n";
+                    out << "Path:       " << af->path << "\n";
+                    out << "File Type:  " << af->fileType << "\n";
+                    out << "Label:      " << af->label.value_or("(none)") << "\n";
+
+                    const auto entry = database.getEntry(af->entryId);
+                    if (entry) {
+                        out << "\n<h2>Entry DB Record</h2>";
+                        out << "Entry ID:   " << entry->id << "\n";
+                        out << "Seed URL:   " << entry->url << "\n";
+                        out << "Status:     " << entry->status << "\n";
+                    }
+
+                    // 2. Physical File
+                    out << "<h2>2. Physical File</h2>";
+                    std::filesystem::path fullPath = fileService.dataRoot() / af->path;
+                    out << "Absolute Path: " << fullPath.string() << "\n";
+                    if (std::filesystem::exists(fullPath)) {
+                        out << "Exists:        <span class='ok'>YES</span>\n";
+                        out << "Size:          " << std::filesystem::file_size(fullPath) << " bytes\n";
+
+                        // Read first 4 bytes for ZIP signature
+                        std::ifstream fs(fullPath, std::ios::binary);
+                        char buf[4];
+                        if (fs.read(buf, 4)) {
+                            out << "Header (hex):  ";
+                            for(int i=0; i<4; ++i) {
+                                out << std::hex << std::setw(2) << std::setfill('0') << (static_cast<int>(buf[i]) & 0xff) << " ";
+                            }
+                            out << std::dec << "\n";
+                            if (buf[0] == 'P' && buf[1] == 'K') {
+                                out << "Signature:     <span class='ok'>PK (ZIP)</span>\n";
+                            } else {
+                                out << "Signature:     <span class='err'>UNKNOWN (Not a ZIP)</span>\n";
+                            }
+                        }
+                    } else {
+                        out << "Exists:        <span class='err'>NO (File missing on disk)</span>\n";
+                    }
+
+                    // 3. WACZ Public Serving
+                    out << "<h2>3. Public Serving</h2>";
+                    out << "Source URL:    " << fileService.publicArchivePath(af->path) << "\n";
+
+                    // 4. ZIP Contents & Index (via unzip)
+                    out << "<h2>4. ZIP Contents (unzip -l)</h2>";
+                    std::string cmdL = "unzip -l \"" + fullPath.string() + "\" 2>&1";
+                    FILE* pipeL = popen(cmdL.c_str(), "r");
+                    if (pipeL) {
+                        char buffer[128];
+                        while (fgets(buffer, sizeof(buffer), pipeL) != NULL) out << buffer;
+                        pclose(pipeL);
+                    }
+
+                    out << "<h2>5. CDXJ Index (first 20 lines)</h2>";
+                    std::string cmdI = "unzip -p \"" + fullPath.string() + "\" indexes/index.cdxj 2>/dev/null | head -20";
+                    FILE* pipeI = popen(cmdI.c_str(), "r");
+                    if (pipeI) {
+                        char buffer[256];
+                        while (fgets(buffer, sizeof(buffer), pipeI) != NULL) out << buffer;
+                        pclose(pipeI);
+                    }
+
+                    out << "<h2>6. Datapackage.json</h2>";
+                    std::string cmdD = "unzip -p \"" + fullPath.string() + "\" datapackage.json 2>/dev/null";
+                    FILE* pipeD = popen(cmdD.c_str(), "r");
+                    if (pipeD) {
+                        char buffer[256];
+                        while (fgets(buffer, sizeof(buffer), pipeD) != NULL) out << buffer;
+                        pclose(pipeD);
+                    }
+
+                    out << "</body></html>";
+                    return htmlResponse(out.str());
+                } catch (const std::exception& e) {
+                    return crow::response(500, std::string("Debug failed: ") + e.what());
                 }
             }
         );
