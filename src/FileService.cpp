@@ -121,30 +121,6 @@ crow::response FileService::serveArchive(const crow::request& request, const std
         }
 
         const std::uintmax_t fileSize = std::filesystem::file_size(path);
-        std::uintmax_t start = 0;
-        std::uintmax_t end = fileSize == 0 ? 0 : fileSize - 1;
-        bool partial = false;
-
-        const std::string range = request.get_header_value("Range");
-        if (!range.empty() && startsWith(range, "bytes=")) {
-            const std::string spec = range.substr(6);
-            const auto dash = spec.find('-');
-            if (dash != std::string::npos) {
-                const std::string startText = spec.substr(0, dash);
-                const std::string endText = spec.substr(dash + 1);
-
-                if (!startText.empty()) {
-                    start = static_cast<std::uintmax_t>(std::stoull(startText));
-                }
-                if (!endText.empty()) {
-                    end = static_cast<std::uintmax_t>(std::stoull(endText));
-                }
-                if (fileSize > 0 && start < fileSize) {
-                    end = std::min(end, fileSize - 1);
-                    partial = true;
-                }
-            }
-        }
 
         if (fileSize == 0) {
             crow::response response(200, "");
@@ -153,10 +129,72 @@ crow::response FileService::serveArchive(const crow::request& request, const std
             return response;
         }
 
-        if (start > end || start >= fileSize) {
-            crow::response response(416, "Requested range not satisfiable");
+        std::uintmax_t start = 0;
+        std::uintmax_t end = fileSize - 1;
+        bool partial = false;
+        bool invalidRange = false;
+
+        const std::string range = request.get_header_value("Range");
+        if (!range.empty()) {
+            if (!startsWith(range, "bytes=")) {
+                invalidRange = true;
+            } else {
+                // ReplayWeb.page/ZIP readers commonly ask for the end of the
+                // WACZ file using a suffix range such as "bytes=-65536" to read
+                // the ZIP central directory. That means the *last* 65536 bytes,
+                // not bytes 0..65536.
+                const std::string spec = range.substr(6);
+                const auto dash = spec.find('-');
+
+                // This endpoint supports a single byte range, which is enough
+                // for ReplayWeb.page/WACZ. Reject multi-range and malformed input.
+                if (dash == std::string::npos || spec.find(',', dash + 1) != std::string::npos) {
+                    invalidRange = true;
+                } else {
+                    const std::string startText = spec.substr(0, dash);
+                    const std::string endText = spec.substr(dash + 1);
+
+                    try {
+                        if (startText.empty()) {
+                            // Suffix byte range: bytes=-N means last N bytes.
+                            if (endText.empty()) {
+                                invalidRange = true;
+                            } else {
+                                const auto suffixLength = static_cast<std::uintmax_t>(std::stoull(endText));
+                                if (suffixLength == 0) {
+                                    invalidRange = true;
+                                } else {
+                                    start = suffixLength >= fileSize ? 0 : fileSize - suffixLength;
+                                    end = fileSize - 1;
+                                    partial = true;
+                                }
+                            }
+                        } else {
+                            // Normal range: bytes=N-M or open-ended bytes=N-
+                            start = static_cast<std::uintmax_t>(std::stoull(startText));
+                            end = endText.empty()
+                                ? fileSize - 1
+                                : static_cast<std::uintmax_t>(std::stoull(endText));
+
+                            if (start >= fileSize || start > end) {
+                                invalidRange = true;
+                            } else {
+                                end = std::min(end, fileSize - 1);
+                                partial = true;
+                            }
+                        }
+                    } catch (const std::exception&) {
+                        invalidRange = true;
+                    }
+                }
+            }
+        }
+
+        if (invalidRange) {
+            crow::response response(416, "");
             addArchiveHeaders(response);
             response.add_header("Content-Range", "bytes */" + std::to_string(fileSize));
+            response.add_header("Content-Length", "0");
             return response;
         }
 
@@ -166,7 +204,9 @@ crow::response FileService::serveArchive(const crow::request& request, const std
                   << (partial ? (" Content-Range: bytes " + std::to_string(start) + "-"
                                  + std::to_string(end) + "/" + std::to_string(fileSize)) : "")
                   << "\n";
-        crow::response response(status, readBytes(path, start, length));
+
+        const bool isHead = request.method == crow::HTTPMethod::Head;
+        crow::response response(status, isHead ? "" : readBytes(path, start, length));
         addArchiveHeaders(response);
         response.add_header("Content-Length", std::to_string(length));
         if (partial) {
