@@ -27,12 +27,14 @@ public:
     void deleteCollection(int id);
 
     // Entries
-    int createEntry(int collectionId, const std::string& url, const std::optional<std::string>& title = std::nullopt);
+    int createEntry(int collectionId, const std::string& url, const std::optional<std::string>& title = std::nullopt,
+                    CaptureDepth captureDepth = CaptureDepth::CURRENT_PAGE_ONLY);
     int getNextEntryNumberForCollection(int collectionId) const;
     std::vector<Entry> listEntries() const;
     std::vector<Entry> listEntriesByCollection(int collectionId) const;
     std::optional<Entry> getEntry(int id) const;
-    void updateEntry(int entryId, const std::string& url, const std::string& title, const std::string& note);
+    void updateEntry(int entryId, const std::string& url, const std::string& title, const std::string& note,
+                     CaptureDepth captureDepth = CaptureDepth::CURRENT_PAGE_ONLY);
     void updateEntryStatus(int entryId, const std::string& status);
     void setEntryError(int entryId, const std::string& errorMessage);
     void markEntryArchived(int entryId);

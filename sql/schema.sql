@@ -18,6 +18,7 @@ CREATE TABLE schema_version (
 --   3 — per-collection entry numbering (number_per_collection on entry);
 --         label and source columns on archive_file
 --   4 — unique URL per collection: UNIQUE INDEX on (collection_id, url) in entry
+--   5 — capture depth: capture_depth TEXT column on entry (default CURRENT_PAGE_ONLY)
 
 -- ---------------------------------------------------------------------------
 -- Core tables
@@ -45,6 +46,9 @@ CREATE TABLE entry (
     updated_at             DATETIME DEFAULT CURRENT_TIMESTAMP,
     archived_at            DATETIME,
     last_error             TEXT,
+
+    capture_depth          TEXT NOT NULL DEFAULT 'CURRENT_PAGE_ONLY',
+        -- CURRENT_PAGE_ONLY | CURRENT_PAGE_AND_SUBPAGES
 
     -- Legacy columns kept for backward compatibility; prefer archive_file and crawl_run.
     warc_path              TEXT,

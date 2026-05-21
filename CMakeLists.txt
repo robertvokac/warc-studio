@@ -63,11 +63,32 @@ find_package(OpenSSL REQUIRED)
 add_executable(warc-studio
     src/main.cpp
     src/BrowsertrixService.cpp
+    src/CaptureDepthPolicy.cpp
     src/Database.cpp
     src/FileService.cpp
     src/Html.cpp
     src/HttpUtil.cpp
 )
+
+# ---------------------------------------------------------------------------
+# Unit tests
+# ---------------------------------------------------------------------------
+
+add_executable(warc-studio-tests
+    src/CaptureDepthPolicy.cpp
+    tests/test_capture_depth_policy.cpp
+)
+
+target_include_directories(warc-studio-tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+    target_compile_options(warc-studio-tests PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(warc-studio-tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 target_include_directories(warc-studio
     PRIVATE

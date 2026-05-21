@@ -542,7 +542,9 @@ int main() {
                     const int collectionId = std::stoi(requiredTextField(form, "collection_id"));
                     const std::string url = requiredTextField(form, "url");
                     const auto title = optionalTextField(form, "title");
-                    const int entryId = database.createEntry(collectionId, url, title);
+                    const std::string depthStr = optionalTextField(form, "capture_depth").value_or("CURRENT_PAGE_ONLY");
+                    const warc_studio::CaptureDepth captureDepth = warc_studio::captureDepthFromString(depthStr);
+                    const int entryId = database.createEntry(collectionId, url, title, captureDepth);
                     return redirectWithMessageTo(
                         "/collections/" + std::to_string(collectionId) + "/entries",
                         "Entry was created.");
@@ -582,7 +584,9 @@ int main() {
                     const std::string url = requiredTextField(form, "url");
                     const std::string title = optionalTextField(form, "title").value_or("");
                     const std::string note = optionalTextField(form, "note").value_or("");
-                    database.updateEntry(entryId, url, title, note);
+                    const std::string depthStr = optionalTextField(form, "capture_depth").value_or("CURRENT_PAGE_ONLY");
+                    const warc_studio::CaptureDepth captureDepth = warc_studio::captureDepthFromString(depthStr);
+                    database.updateEntry(entryId, url, title, note, captureDepth);
                     return redirectWithMessageTo(
                         "/entry/" + std::to_string(entryId), "Entry was updated.");
                 } catch (const std::exception& error) {

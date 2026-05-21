@@ -13,6 +13,32 @@ struct Collection {
     std::string updatedAt;
 };
 
+// Capture depth controls which discovered links may be enqueued during crawling.
+// Resources required by the current page (CSS, JS, images, fonts, XHR) are
+// always captured regardless of this setting.
+enum class CaptureDepth {
+    CURRENT_PAGE_ONLY,        // only the starting URL; no other page links
+    CURRENT_PAGE_AND_SUBPAGES // starting URL + URLs whose path is under the base path
+};
+
+inline std::string captureDepthToString(CaptureDepth d) {
+    return d == CaptureDepth::CURRENT_PAGE_AND_SUBPAGES
+        ? "CURRENT_PAGE_AND_SUBPAGES"
+        : "CURRENT_PAGE_ONLY";
+}
+
+inline CaptureDepth captureDepthFromString(const std::string& s) {
+    return s == "CURRENT_PAGE_AND_SUBPAGES"
+        ? CaptureDepth::CURRENT_PAGE_AND_SUBPAGES
+        : CaptureDepth::CURRENT_PAGE_ONLY;
+}
+
+inline std::string captureDepthLabel(CaptureDepth d) {
+    return d == CaptureDepth::CURRENT_PAGE_AND_SUBPAGES
+        ? "Page + subpages"
+        : "Page only";
+}
+
 struct Entry {
     int id{};
     int collectionId{};
@@ -28,6 +54,7 @@ struct Entry {
     std::optional<std::string> archivedAt;
     std::optional<std::string> lastError;
     int archiveFileCount{};
+    CaptureDepth captureDepth{CaptureDepth::CURRENT_PAGE_ONLY};
 
     // Legacy columns kept for backward compatibility during migration.
     // New code should prefer ArchiveFile and CrawlRun.

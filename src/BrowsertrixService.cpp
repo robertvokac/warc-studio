@@ -138,12 +138,21 @@ RecordingStartResult BrowsertrixService::startRecording(const Entry& entry) cons
     // that starts an interactive browser session and returns the browser URL.
     // HACK: wrap with 'sg docker -c ...' so the current user inherits the docker group
     // without requiring a re-login. Remove once the user is permanently added to the docker group.
+    // Map capture_depth to Browsertrix --scopeType:
+    //   CURRENT_PAGE_ONLY        → "page"   (crawl only the exact starting URL)
+    //   CURRENT_PAGE_AND_SUBPAGES → "prefix" (crawl URLs whose path starts with the base prefix)
+    const std::string scopeType =
+        (entry.captureDepth == CaptureDepth::CURRENT_PAGE_AND_SUBPAGES)
+        ? "prefix"
+        : "page";
+
     const std::string command = std::format(
-        "sg docker -c 'docker run -d --name {} -v {}:/crawls {} crawl --url {} --generateWACZ --text --collection {} --crawlId {}'",
+        "sg docker -c 'docker run -d --name {} -v {}:/crawls {} crawl --url {} --scopeType {} --generateWACZ --text --collection {} --crawlId {}'",
         containerName(browsertrixId),
         fileService_.crawlsRoot().string(),
         image_,
         entry.url,
+        scopeType,
         browsertrixId,
         browsertrixId
     );

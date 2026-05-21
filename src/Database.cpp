@@ -132,8 +132,8 @@ Entry readEntry(sqlite3_stmt* stmt) {
     // Columns: e.id, e.collection_id, e.number_per_collection, c.name,
     //          e.url, e.normalized_url, e.title, e.status, e.note,
     //          e.created_at, e.updated_at, e.archived_at, e.last_error,
-    //          e.warc_path, e.browsertrix_id,
-    //          (SELECT COUNT(*) FROM archive_file WHERE entry_id=e.id) AS archive_file_count
+    //          (archive_file_count), e.warc_path, e.browsertrix_id,
+    //          e.capture_depth
     return Entry{
         .id = sqlite3_column_int(stmt, 0),
         .collectionId = sqlite3_column_int(stmt, 1),
@@ -149,8 +149,9 @@ Entry readEntry(sqlite3_stmt* stmt) {
         .archivedAt = optionalColumnText(stmt, 11),
         .lastError = optionalColumnText(stmt, 12),
         .archiveFileCount = sqlite3_column_int(stmt, 13),
-        .warcPath = optionalColumnText(stmt, 14),
-        .browsertrixId = optionalColumnText(stmt, 15),
+        .captureDepth = captureDepthFromString(columnText(stmt, 14)),
+        .warcPath = optionalColumnText(stmt, 15),
+        .browsertrixId = optionalColumnText(stmt, 16),
     };
 }
 
@@ -243,7 +244,7 @@ void Database::execute(const char* sql) const {
 // ---------------------------------------------------------------------------
 
 // Bump this constant and append to kMigrations when adding new schema changes.
-static constexpr int kCurrentSchemaVersion = 4;
+static constexpr int kCurrentSchemaVersion = 5;
 
 // kMigrations[N] migrates the database from version N to version N+1.
 static const char* kMigrations[] = {
@@ -375,6 +376,12 @@ static const char* kMigrations[] = {
     R"SQL(
         CREATE UNIQUE INDEX IF NOT EXISTS entry_collection_url_unique
             ON entry (collection_id, url);
+    )SQL",
+
+    // v4 → v5 : capture depth field
+    //   - add capture_depth column to entry (default CURRENT_PAGE_ONLY)
+    R"SQL(
+        ALTER TABLE entry ADD COLUMN capture_depth TEXT NOT NULL DEFAULT 'CURRENT_PAGE_ONLY';
     )SQL",
 };
 
@@ -590,6 +597,7 @@ void Database::deleteCollection(int id) {
         e.archived_at,
         e.last_error,
         (SELECT COUNT(*) FROM archive_file af WHERE af.entry_id = e.id) AS archive_file_count,
+        e.capture_depth,
         e.warc_path,
         e.browsertrix_id
     FROM entry e
@@ -612,6 +620,7 @@ static const char* kListEntriesSQL = R"SQL(
         e.archived_at,
         e.last_error,
         (SELECT COUNT(*) FROM archive_file af WHERE af.entry_id = e.id) AS archive_file_count,
+        e.capture_depth,
         e.warc_path,
         e.browsertrix_id
     FROM entry e
@@ -635,6 +644,7 @@ static const char* kGetEntrySQL = R"SQL(
         e.archived_at,
         e.last_error,
         (SELECT COUNT(*) FROM archive_file af WHERE af.entry_id = e.id) AS archive_file_count,
+        e.capture_depth,
         e.warc_path,
         e.browsertrix_id
     FROM entry e
@@ -652,7 +662,8 @@ int Database::getNextEntryNumberForCollection(int collectionId) const {
     return 1;
 }
 
-int Database::createEntry(int collectionId, const std::string& url, const std::optional<std::string>& title) {
+int Database::createEntry(int collectionId, const std::string& url, const std::optional<std::string>& title,
+                          CaptureDepth captureDepth) {
     // Use a transaction to atomically assign number_per_collection.
     execute("BEGIN;");
     try {
@@ -671,11 +682,12 @@ int Database::createEntry(int collectionId, const std::string& url, const std::o
 
         const int nextNumber = getNextEntryNumberForCollection(collectionId);
         Statement stmt(db_,
-            "INSERT INTO entry (collection_id, url, title, number_per_collection) VALUES (?, ?, ?, ?);");
+            "INSERT INTO entry (collection_id, url, title, number_per_collection, capture_depth) VALUES (?, ?, ?, ?, ?);");
         stmt.bindInt(1, collectionId);
         stmt.bindText(2, url);
         stmt.bindOptionalText(3, title);
         stmt.bindInt(4, nextNumber);
+        stmt.bindText(5, captureDepthToString(captureDepth));
 
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             throw std::runtime_error(sqlite3_errmsg(db_));
@@ -715,6 +727,7 @@ std::vector<Entry> Database::listEntriesByCollection(int collectionId) const {
             e.archived_at,
             e.last_error,
             (SELECT COUNT(*) FROM archive_file af WHERE af.entry_id = e.id) AS archive_file_count,
+            e.capture_depth,
             e.warc_path,
             e.browsertrix_id
         FROM entry e
@@ -779,7 +792,8 @@ void Database::markEntryImportedIfNew(int entryId) {
     }
 }
 
-void Database::updateEntry(int entryId, const std::string& url, const std::string& title, const std::string& note) {
+void Database::updateEntry(int entryId, const std::string& url, const std::string& title, const std::string& note,
+                           CaptureDepth captureDepth) {
     // Check for duplicate URL within the same collection (excluding the entry being updated).
     {
         Statement check(db_,
@@ -796,11 +810,12 @@ void Database::updateEntry(int entryId, const std::string& url, const std::strin
     }
 
     Statement stmt(db_,
-        "UPDATE entry SET url = ?, title = ?, note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;");
+        "UPDATE entry SET url = ?, title = ?, note = ?, capture_depth = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;");
     stmt.bindText(1, url);
     stmt.bindText(2, title);
     stmt.bindText(3, note);
-    stmt.bindInt(4, entryId);
+    stmt.bindText(4, captureDepthToString(captureDepth));
+    stmt.bindInt(5, entryId);
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         throw std::runtime_error(sqlite3_errmsg(db_));
     }

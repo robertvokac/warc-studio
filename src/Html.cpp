@@ -173,13 +173,14 @@ void renderEntriesTable(std::ostringstream& html,
     if (showCollection) html << "  <th>Collection</th>\n";
     html << "  <th>Title / URL</th>\n";
     html << "  <th>Status</th>\n";
+    html << "  <th>Depth</th>\n";
     html << "  <th>Archives</th>\n";
     html << "  <th>Created</th>\n";
     html << "  <th>Actions</th>\n";
     html << "</tr></thead>\n<tbody>\n";
 
     if (entries.empty()) {
-        const int cols = showCollection ? 7 : 6;
+        const int cols = showCollection ? 8 : 7;
         html << "<tr><td colspan=\"" << cols << "\" class=\"muted\">No entries yet.</td></tr>\n";
     }
 
@@ -200,6 +201,8 @@ void renderEntriesTable(std::ostringstream& html,
         html << "</td>\n";
         // Status
         html << "  <td>" << statusBadge(entry.status) << "</td>\n";
+        // Capture depth
+        html << "  <td class=\"muted\">" << htmlEscape(captureDepthLabel(entry.captureDepth)) << "</td>\n";
         // Archive count
         html << "  <td class=\"muted\">" << entry.archiveFileCount << "</td>\n";
         // Created
@@ -336,6 +339,10 @@ std::string renderEntriesPage(
     html << "<div class=\"form-row\">\n";
     html << "  <input type=\"url\" name=\"url\" required placeholder=\"https://example.com\" size=\"44\">\n";
     html << "  <input type=\"text\" name=\"title\" placeholder=\"Optional title\" size=\"28\">\n";
+    html << "  <select name=\"capture_depth\">\n";
+    html << "    <option value=\"CURRENT_PAGE_ONLY\">Page only</option>\n";
+    html << "    <option value=\"CURRENT_PAGE_AND_SUBPAGES\">Page + subpages</option>\n";
+    html << "  </select>\n";
     html << "  <button type=\"submit\">Create entry</button>\n";
     html << "</div>\n</form>\n</div>\n";
 
@@ -403,6 +410,7 @@ std::string renderEntryDetailPage(
     html << "<tr><th>URL</th><td class=\"mono\"><a href=\"" << htmlEscape(entry.url) << "\" target=\"_blank\">"
          << htmlEscape(entry.url) << "</a></td></tr>\n";
     html << "<tr><th>Status</th><td>" << statusBadge(entry.status) << "</td></tr>\n";
+    html << "<tr><th>Depth</th><td>" << htmlEscape(captureDepthLabel(entry.captureDepth)) << "</td></tr>\n";
     html << "<tr><th>Created</th><td class=\"muted\">" << htmlEscape(entry.createdAt) << "</td></tr>\n";
     if (entry.archivedAt) {
         html << "<tr><th>Archived</th><td class=\"muted\">" << htmlEscape(*entry.archivedAt) << "</td></tr>\n";
@@ -429,6 +437,18 @@ std::string renderEntryDetailPage(
     html << "<div class=\"form-group\">\n";
     html << "  <label>Note</label>\n";
     html << "  <textarea name=\"note\" rows=\"3\" style=\"width:100%;max-width:480px;\">" << htmlEscape(entry.note.value_or("")) << "</textarea>\n";
+    html << "</div>\n";
+    html << "<div class=\"form-group\">\n";
+    html << "  <label>Depth</label>\n";
+    html << "  <select name=\"capture_depth\">\n";
+    const char* depthValues[] = {"CURRENT_PAGE_ONLY", "CURRENT_PAGE_AND_SUBPAGES", nullptr};
+    const char* depthLabels[] = {"Page only", "Page + subpages", nullptr};
+    for (int i = 0; depthValues[i] != nullptr; ++i) {
+        html << "    <option value=\"" << depthValues[i] << "\"";
+        if (captureDepthToString(entry.captureDepth) == depthValues[i]) html << " selected";
+        html << ">" << depthLabels[i] << "</option>\n";
+    }
+    html << "  </select>\n";
     html << "</div>\n";
     html << "<button type=\"submit\">Save changes</button>\n";
     html << "</form>\n";
