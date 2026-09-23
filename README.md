@@ -1,27 +1,74 @@
 # warc-studio
 
-A lightweight local web application for managing web archive collections, recording with Browsertrix, and replaying WACZ files via ReplayWeb.page.
+A personal, local web archive — like the [Wayback Machine](https://web.archive.org/), but for the pages *you* want to keep.
+Paste a URL, see whether it is already archived, archive it with the built-in crawler and tag it.
+Every archiving request becomes its own **capture**: one timestamped WARC file.
 
-Built with **C++23**, **CMake**, **Crow**, **SQLite**, and **Docker** (for Browsertrix).
+Built with **C++23**, **CMake**, **Crow**, **SQLite**, **libcurl** and **ReplayWeb.page**. No Docker, no external crawler.
+
+---
+
+## Concepts
+
+The terminology follows the Wayback Machine:
+
+| Term          | Meaning |
+|---------------|---------|
+| **Capture**   | One archiving request of one URL at one moment (a.k.a. snapshot). Owns exactly one archive file. |
+| **Timestamp** | When the capture was taken, `YYYYMMDDhhmmss` in UTC (e.g. `20260923180211`), as in `web.archive.org/web/<timestamp>/<url>`. |
+| **Tag**       | Free-form label; the main way to organise captures. A capture can have any number of tags. |
+| **URL key**   | Normalized URL used to answer "is this URL archived?" — scheme, `www.`, default port, fragment and trailing `/` are ignored (`https://www.Example.com/a/` = `example.com/a`). |
+| **Depth**     | How many clicks away from the page links are followed: *Page only* (0), 1–10, or *All linked pages*. Each archived page comes with all its resources. |
+| **Scope**     | Which links may be followed: *same path* (under the start page's directory), *whole domain* (subdomains included) or *any site* (only with a limited depth). *Max pages* caps the crawl. |
+
+Capture statuses: `queued` → `crawling` → `archived`, or `failed` / `cancelled`.
 
 ---
 
 ## Features
 
-- Create and manage **collections** of URLs to archive; edit collection name and description.
-- Per-collection **entry numbering** (`#1`, `#2`, `#3`, …) that resets for each collection.
-- Multiple **archive files per entry** (WACZ and WARC), from Browsertrix or manual upload.
-- **SHA-256 checksums** computed automatically for every uploaded or Browsertrix-generated archive file.
-- **Entry statuses**: `new`, `queued`, `recording`, `archived`, `imported`, `failed`, `needs_review`, `ignored`.
-- **Entry editing**: edit URL, title, and note from the entry detail page.
-- **Manual upload** of `.warc`, `.warc.gz`, and `.wacz` files; edit label and delete individual archive files.
-- Start and stop **Browsertrix crawler** recordings (via Docker); Start recording returns immediately and does not block the browser.
-- **Crawl run history** tracked in the database: each Browsertrix start/stop creates a `crawl_run` row with timestamps, exit code, and error messages; visible on the entry detail page.
-- **Physical archive file deletion**: deleting an entry (or a single archive file) removes both the database rows and the files on disk.
-- **Replay** WACZ archives through [ReplayWeb.page](https://replayweb.page/).
-- Clean **multi-section web UI** with top navigation, collection switcher, status badges, and CSS styling.
-- **Favicon** (`/favicon.svg`) and external CSS (`/static/style.css`).
-- All data stored locally in a single **SQLite** database.
+- **Save Page Now** — paste a URL; while typing, warc-studio shows whether (and when) it was archived before. Save it with tags, depth and an optional title.
+- **Bookmarklet** (see *About*) — save the page you are reading with one click from any browser tab.
+- **Bulk save** — many URLs at once (one per line), optionally skipping those already archived.
+- **Built-in crawler** — see below; runs in background worker threads, no manual start/stop. Captures interrupted by a restart are re-queued. A running crawl can be stopped early (what was fetched so far is kept), a failed one retried.
+- **Browse** captures chronologically (newest or oldest first, grouped by day), **search** by URL or title substring, filter by **tags** (all must match) and status.
+- **URL history** — all captures of one URL, like the Wayback Machine calendar.
+- **Upload** your own `.warc`, `.warc.gz` or `.wacz` — URL, capture date and title are read from the file when not given.
+- **Download** any archive file (named `<host>-<timestamp>.<ext>`); file size and SHA-256 are shown everywhere.
+- **Replay** WACZ and WARC files with the locally hosted ReplayWeb.page.
+- **Tags page** — tag cloud, rename (renaming onto an existing tag merges them) and delete.
+- **Wayback-style URLs** — `/web/*/<url>` and `/web/<timestamp>/<url>`.
+
+---
+
+## Built-in crawler
+
+Each capture is crawled by warc-studio itself (`src/Crawler.cpp`) and written to its own `.warc.gz`:
+
+1. The page is fetched with libcurl (HTTP/1.1, browser-like User-Agent, cookies kept for the crawl).
+   Redirects are recorded and followed.
+2. Its HTML is parsed for everything needed to render it: stylesheets, scripts, images (`src`, `srcset`,
+   `data-src`), fonts and images referenced from CSS (`url()`, `@import`), inline `style` attributes,
+   `<style>` blocks, media, icons, `og:image` and embedded `<iframe>` documents (with their resources).
+   Resources on other hosts (CDNs) are included. They are fetched 6 at a time, like a browser does.
+   All `srcset` candidates are fetched, so replay works on any screen size.
+3. Inline scripts and fetched `.js` files are scanned for quoted URLs of static files (`.css`, `.js`,
+   images, fonts, media, `.json`) — this catches e.g. stylesheets added with `document.write`.
+   It is a heuristic: some guesses end as recorded 404s, which is harmless.
+4. With a depth above 0, links are followed breadth-first (nearest pages first) up to the depth, within the
+   scope and up to the page limit. *Same path*: same host, path under the start page's directory.
+   *Whole domain*: the site domain and its subdomains (`blog.example.co.uk` → `example.co.uk`; tenants of
+   hosting domains such as `github.io` or `blogspot.com` count as separate sites). *Any site*: everything.
+5. Every request and response is stored as WARC 1.1 `request`/`response` records **exactly as received**
+   (compressed and chunked bodies are kept raw), each record its own gzip member, with SHA-1 block digests.
+   The files validate with `warcio check` and replay in ReplayWeb.page.
+
+**Limitation:** JavaScript is not executed. Classic sites, blogs, documentation, articles, Wikipedia and
+portals such as seznam.cz are archived well; content that a page fetches with JavaScript through
+dynamically built URLs (single-page apps, infinite scroll, some social networks) is missing from the capture.
+
+Limits: responses larger than `WARC_STUDIO_MAX_RESOURCE_MB` are skipped, at most 3000 resources and
+10000 pages per capture, optional time limit per capture.
 
 ---
 
@@ -29,9 +76,9 @@ Built with **C++23**, **CMake**, **Crow**, **SQLite**, and **Docker** (for Brows
 
 - C++23 compiler (GCC 13+ or Clang 16+)
 - CMake 3.26+
-- SQLite3 development headers (`libsqlite3-dev`)
-- OpenSSL development headers (`libssl-dev`) — used for SHA-256 checksums
-- Docker (for Browsertrix recording; optional)
+- SQLite3, OpenSSL, zlib and libcurl development headers
+  (`libsqlite3-dev libssl-dev zlib1g-dev libcurl4-openssl-dev`)
+- `unzip` (reads page metadata from uploaded WACZ files)
 
 ---
 
@@ -39,10 +86,10 @@ Built with **C++23**, **CMake**, **Crow**, **SQLite**, and **Docker** (for Brows
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target warc-studio
+cmake --build build
 ```
 
----
+Tests: `./build/warc-studio-tests` and `./build/warc-studio-util-tests`.
 
 ## Run
 
@@ -51,163 +98,81 @@ cd build
 ./warc-studio
 ```
 
-Then open [http://localhost:18080/](http://localhost:18080/) in your browser.
-
-The `static/` directory (from the project root) must be accessible from the working directory when running the app. The app looks for `static/` relative to the current working directory.
+Then open [http://localhost:18080/](http://localhost:18080/).
 
 ---
 
 ## Configuration (environment variables)
 
-| Variable                       | Default                                 | Description                      |
-|--------------------------------|-----------------------------------------|----------------------------------|
-| `WARC_STUDIO_DATA_DIR`         | `data`                                  | Directory for SQLite DB + archives |
-| `WARC_STUDIO_PORT`             | `18080`                                 | HTTP port                        |
-| `WARC_STUDIO_BROWSERTRIX_IMAGE`| `webrecorder/browsertrix-crawler:latest`| Docker image for Browsertrix     |
-| `WARC_STUDIO_RUN_BROWSERTRIX`  | `true`                                  | Set to `false` to disable Docker |
+| Variable                        | Default                                  | Description |
+|---------------------------------|------------------------------------------|-------------|
+| `WARC_STUDIO_DATA_DIR`          | `data`                                   | SQLite DB, archives, crawl output and logs |
+| `WARC_STUDIO_PORT`              | `18080`                                  | HTTP port |
+| `WARC_STUDIO_CRAWL_WORKERS`     | `2`                                      | Number of captures crawled in parallel |
+| `WARC_STUDIO_CRAWL_TIME_LIMIT`  | `0`                                      | Time limit per capture in seconds, `0` = none |
+| `WARC_STUDIO_MAX_RESOURCE_MB`   | `100`                                    | Larger responses are skipped |
+| `WARC_STUDIO_USER_AGENT`        | Chrome on Linux + `warc-studio/0.4`      | User-Agent sent by the crawler |
+| `WARC_STUDIO_STATIC_DIR`        | `static/` next to the executable         | Static assets directory |
 
 ---
 
-## Web UI sections
+## Data layout
 
-### Collections (`/collections`)
-- List all collections with entry counts and creation date.
-- Create a new collection with name and optional description.
-- **Edit** button on each collection row opens the collection edit page.
-- Open entries for a collection.
+```
+data/
+  warc-studio.sqlite3
+  archives/<YYYY>/<MM>/<timestamp>-<n>.<warc.gz|warc|wacz>   one file per capture
+  crawls/capture-<id>.warc.gz                                WARC being written (moved to archives/ when done)
+  logs/capture-<id>.log                                      crawl log (every URL with status), shown on the capture page
+```
 
-### Collection edit (`/collection/<id>`)
-- Edit collection name and description.
-- Delete collection (cascades to all entries and archive files).
-- Add entries directly from this page.
+## Database
 
-### Entries (`/entries` or `/collections/<id>/entries`)
-- Show only entries from the currently selected collection.
-- **Collection switcher** dropdown at the top; auto-selects first collection if none is chosen.
-- **"Edit collection"** button next to the switcher opens the collection edit page.
-- Each entry shows: number (`#1`, `#2`, …), title/URL, status badge, archive count, actions.
-- Create a new entry (URL + optional title).
-- Actions: Start recording, Stop recording, Detail, Replay latest WACZ, Delete.
-
-### Entry detail (`/entry/<id>`)
-- Full entry info: collection, number, URL, status, dates, notes, errors.
-- **Edit entry**: update URL, title, and note inline.
-- Change status from a dropdown (any of the eight statuses).
-- Browsertrix recording controls (Start / Stop); Start recording returns immediately without blocking.
-- List of all archive files with type badge, source, size, SHA-256 prefix, replay button.
-- **Edit label** inline per archive file (expandable form).
-- **Delete** individual archive file (removes DB row and file from disk).
-- Upload form for `.warc`, `.warc.gz`, `.wacz` files.
-- **Crawl run history**: table of all Browsertrix runs for this entry (status, timestamps, exit code, error message).
-- Delete entry (removes DB rows and physical files from disk).
-
-### Archive Files (`/archives-browser`)
-- Global view of archive files for the selected collection.
-- Shows entry number, title, file type, source, label, size, date, replay button.
-
-### About (`/about`)
-- Data directory, Browsertrix image, enabled/disabled status, version, technology stack.
-
----
-
-## Entry statuses
-
-| Status         | Meaning                                            |
-|----------------|----------------------------------------------------|
-| `new`          | Entry created; no archive yet                      |
-| `queued`       | Planned for recording                              |
-| `recording`    | Browsertrix is currently running                   |
-| `archived`     | Browsertrix recording completed successfully       |
-| `imported`     | At least one manually uploaded archive             |
-| `failed`       | Last recording or upload failed                    |
-| `needs_review` | Archive exists but flagged for review              |
-| `ignored`      | Intentionally not being archived                   |
-
----
-
-## Database schema
-
-Schema version: **3**.
-
-Key tables:
-
-- **`collection`** — name, description, timestamps.
-- **`entry`** — URL, title, status, `number_per_collection` (unique per collection), timestamps, last error.
-- **`archive_file`** — path, file_type (`wacz`/`warc`), label, source, size, sha256 (SHA-256 hex digest), timestamps.
-- **`crawl_run`** — Browsertrix run records (status, browsertrix_id, docker_container_id, started_at, stopped_at, exit_code, error_message).
-- **`capture_metadata`**, **`tag`**, **`entry_tag`**, **`entry_note`** — optional metadata.
-
-Migrations are applied automatically at startup. See `sql/schema.sql` for the full reference schema.
-
----
-
-## Static files
-
-- `static/favicon.svg` — archive-themed favicon (served at `/favicon.svg`).
-- `static/style.css` — all UI styling (served at `/static/style.css`).
-
----
-
-## Archive file upload
-
-- Upload `.warc`, `.warc.gz`, or `.wacz` files from the entry detail page.
-- Files are stored under `data/archives/<collectionId>/<entryId>/<timestamp>.<ext>`.
-- File type is determined from the extension; unknown types are rejected.
-- Empty files and path traversal attempts are rejected.
-- On successful upload, an `archive_file` row is inserted and entry status is set to `imported` if it was `new`.
-
-## WARC replay
-
-- WACZ files are replayed via an embedded [ReplayWeb.page](https://replayweb.page/) player served locally.
-- WARC files (`.warc`, `.warc.gz`) are stored but replay is not supported yet; a clear message is shown.
-- The ReplayWeb.page `ui.js` and `sw.js` bundles are vendored in `static/` so no CDN is required and there is no mixed-content issue.
-- All replay assets are served locally: `/replay/ui.js` (UI bundle), `/replay/sw.js` (service worker with scope `/replay/`).
-- The script tag on the replay page uses `/replay/ui.js` which is consistent with `replayBase="/replay/"`, so the web component resolves all sub-resources from the same local path prefix.
-
-### Replay troubleshooting
-
-**Replay opens but archive appears empty ("No Results Found")**
-
-1. Verify the WACZ file downloads correctly: `curl -o /tmp/test.wacz http://localhost:18080/archives/<path>`
-2. Verify CORS and Range headers: `curl -I -H "Range: bytes=0-1023" http://localhost:18080/archives/<path>` — expect `206 Partial Content` with `Access-Control-Allow-Origin: *`
-3. **Clear stale service worker**: DevTools → Application → Service Workers → Unregister all service workers for `localhost`, then hard refresh (Ctrl+Shift+R / Cmd+Shift+R). Old cached service workers with wrong scope may prevent replay from loading.
-4. Try an incognito/private window to avoid stale service worker state.
-5. WARC replay is not supported — only WACZ files can be replayed.
+Schema version **7** — tables `capture`, `tag`, `capture_tag` (see `sql/schema.sql`).
+Migrations run automatically at startup. Migration 6 converts the old collections/entries model:
+every old archive file becomes an archived capture, entries without an archive file become failed
+captures (so no URL is lost — use *Archive again*), entry tags are kept, collections are dropped.
 
 ---
 
 ## Routes
 
 ```
-GET  /                               — Legacy index page (collections + all entries)
-GET  /collections                    — Collections section
-POST /collection/new                 — Create collection
-GET  /collections/<id>/entries       — Entries for a specific collection
-GET  /entries?collection_id=<id>     — Entries with collection switcher
-GET  /entry/<id>                     — Entry detail page
-POST /entry/<id>/update              — Edit entry fields (url, title, note)
-POST /entry/<id>/status              — Change entry status
-POST /entry/<id>/upload              — Upload WARC/WACZ file
-POST /entry/<id>/start               — Start Browsertrix recording
-POST /entry/<id>/stop                — Stop Browsertrix recording
-GET  /entry/<id>/replay/latest       — Replay latest WACZ
-GET  /entry/<id>/replay              — Legacy replay route
-GET  /archive/<id>/replay            — Replay specific archive file
-POST /archive/<id>/update            — Edit archive file label
-POST /archive/<id>/delete            — Delete single archive file
-POST /entry/<id>/delete              — Delete entry
-GET  /collection/<id>                — Collection edit page
-POST /collection/<id>/edit           — Save collection name/description
-POST /collection/<id>/delete         — Delete collection
-GET  /archives-browser               — Archive files browser
-GET  /about                          — Settings / About
-GET  /archives/<path>                — Serve archive files (CORS-enabled, Range support)
-GET  /replay/ui.js                   — ReplayWeb.page UI bundle (self-hosted, local)
-GET  /replay/sw.js                   — ReplayWeb.page service worker (scope /replay/)
-GET  /static/ui.js                   — ReplayWeb.page UI bundle (alternate path)
-GET  /static/sw.js                   — ReplayWeb.page service worker (alternate path)
-GET  /sw.js                          — ReplayWeb.page service worker (root scope, for compatibility)
-GET  /static/style.css               — Application CSS
-GET  /favicon.svg                    — Favicon
-GET  /health                         — Health check
+GET  /                          Save Page Now (+ ?url=&title=&tags= prefill, used by the bookmarklet)
+POST /save                      Queue a capture (url, tags, title, capture_depth, page_limit)
+GET  /save/bulk, POST /save/bulk
+GET  /api/lookup?url=           JSON: captures of a URL (count, last capture)
+GET  /captures                  Browse/search (?q=, tag=, status=, order=oldest, page=)
+GET  /url?url=                  All captures of one URL
+GET  /web/*/<url>               -> /url?url=<url>
+GET  /web/<timestamp>/<url>     -> replay of the capture closest to the timestamp
+GET  /capture/<id>              Capture detail
+POST /capture/<id>/update       Edit URL, title, tags, note
+POST /capture/<id>/cancel       Cancel a queued capture
+POST /capture/<id>/stop         Stop a running crawl early (keeps what was captured)
+POST /capture/<id>/retry        Re-queue a failed/cancelled crawl
+POST /capture/<id>/recapture    New capture of the same URL ("Archive again")
+POST /capture/<id>/delete       Delete capture, its archive file and log
+GET  /capture/<id>/replay       Replay with ReplayWeb.page
+GET  /capture/<id>/download     Download the archive file
+GET  /tags, POST /tags/rename, POST /tags/delete
+GET  /upload, POST /upload      Upload own WARC/WACZ (file, url, tags, title, timestamp, note)
+GET  /about                     Settings, statistics, bookmarklet
+GET  /archives/<path>           Archive files for ReplayWeb.page (CORS, Range support)
+GET  /replay/ui.js, /replay/sw.js, /replay/...   ReplayWeb.page (self-hosted)
+GET  /health
 ```
+
+---
+
+## Replay troubleshooting
+
+ReplayWeb.page (`ui.js`, `sw.js`, vendored from replaywebpage@2.4.6) is served locally under `/replay/`,
+so archives and player share one origin and there is no mixed-content problem.
+
+If a replay shows "No Results Found":
+
+1. Check the file downloads: `curl -o /tmp/test.wacz http://localhost:18080/capture/<id>/download`
+2. Check CORS and Range: `curl -I -H "Range: bytes=0-1023" http://localhost:18080/archives/<path>` — expect `206` with `Access-Control-Allow-Origin: *`
+3. Clear a stale service worker: DevTools → Application → Service Workers → Unregister, then hard refresh.
+4. Try a private window.

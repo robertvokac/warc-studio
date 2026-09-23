@@ -19,100 +19,42 @@ CREATE TABLE schema_version (
 --         label and source columns on archive_file
 --   4 — unique URL per collection: UNIQUE INDEX on (collection_id, url) in entry
 --   5 — capture depth: capture_depth TEXT column on entry (default CURRENT_PAGE_ONLY)
+--   6 — collections and entries replaced by timestamped captures (capture, capture_tag);
+--         old tables migrated and dropped
+--   7 — covering index (status, size_bytes) for archive statistics, replaces capture_status_idx
+--   8 — max_depth (link hops) and crawl_scope replace capture_depth
 
 -- ---------------------------------------------------------------------------
--- Core tables
+-- Captures — one archiving request of one URL at one moment, with one archive file
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE collection (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,
-    description TEXT,
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE capture (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    url           TEXT NOT NULL,
+    url_key       TEXT NOT NULL DEFAULT '',    -- normalized URL for lookups (see makeUrlKey)
+    timestamp     TEXT NOT NULL,               -- YYYYMMDDhhmmss UTC, set when the crawl starts
+    title         TEXT,
+    note          TEXT,
+    status        TEXT NOT NULL DEFAULT 'queued',
+        -- queued | crawling | archived | failed | cancelled
+    source        TEXT NOT NULL DEFAULT 'crawl',   -- crawl | upload
+    max_depth     INTEGER NOT NULL DEFAULT 0,  -- link hops followed from the start page: 0 = page only, -1 = unlimited
+    crawl_scope   TEXT NOT NULL DEFAULT 'PREFIX',
+        -- PREFIX (same host, path under the start directory) | DOMAIN (site domain incl. subdomains) | ANY
+    page_limit    INTEGER,                     -- max pages when max_depth != 0, 0 = none
+    file_path     TEXT,                        -- relative to the data dir: archives/YYYY/MM/<timestamp>-<n>.<ext>
+    file_type     TEXT,                        -- wacz | warc
+    size_bytes    INTEGER,
+    sha256        TEXT,
+    error         TEXT,                        -- failure reason, or a warning for archived captures
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    started_at    DATETIME,
+    finished_at   DATETIME
 );
 
-CREATE TABLE entry (
-    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection_id          INTEGER NOT NULL,
-    number_per_collection  INTEGER NOT NULL,   -- sequential per collection, starts at 1
-    url                    TEXT NOT NULL,
-    normalized_url         TEXT,
-    title                  TEXT,
-    status                 TEXT NOT NULL DEFAULT 'new',
-        -- new | queued | recording | archived | imported | failed | needs_review | ignored
-    note                   TEXT,
-    created_at             DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at             DATETIME DEFAULT CURRENT_TIMESTAMP,
-    archived_at            DATETIME,
-    last_error             TEXT,
-
-    capture_depth          TEXT NOT NULL DEFAULT 'CURRENT_PAGE_ONLY',
-        -- CURRENT_PAGE_ONLY | CURRENT_PAGE_AND_SUBPAGES
-
-    -- Legacy columns kept for backward compatibility; prefer archive_file and crawl_run.
-    warc_path              TEXT,
-    browsertrix_id         TEXT,
-
-    FOREIGN KEY (collection_id) REFERENCES collection(id) ON DELETE CASCADE,
-    UNIQUE (collection_id, number_per_collection)
-);
-
-CREATE UNIQUE INDEX entry_collection_url_unique ON entry (collection_id, url);
-
--- ---------------------------------------------------------------------------
--- Archive files — one or more WACZ/WARC files per entry
--- ---------------------------------------------------------------------------
-
-CREATE TABLE archive_file (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id   INTEGER NOT NULL,
-    path       TEXT NOT NULL,
-    file_type  TEXT NOT NULL DEFAULT 'wacz',   -- wacz | warc
-    label      TEXT,                           -- e.g. "browsertrix recording", "manual upload"
-    source     TEXT NOT NULL DEFAULT 'browsertrix',  -- browsertrix | manual_upload | imported
-    size_bytes INTEGER,
-    sha256     TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (entry_id) REFERENCES entry(id) ON DELETE CASCADE
-);
-
--- ---------------------------------------------------------------------------
--- Crawl runs — one or more crawl attempts per entry
--- ---------------------------------------------------------------------------
-
-CREATE TABLE crawl_run (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id            INTEGER NOT NULL,
-    browsertrix_id      TEXT,
-    docker_container_id TEXT,
-    status              TEXT NOT NULL DEFAULT 'created',  -- created | running | stopped | finished | failed
-    started_at          DATETIME,
-    stopped_at          DATETIME,
-    exit_code           INTEGER,
-    error_message       TEXT,
-    log_path            TEXT,
-
-    FOREIGN KEY (entry_id) REFERENCES entry(id) ON DELETE CASCADE
-);
-
--- ---------------------------------------------------------------------------
--- Capture metadata — optional per-entry crawl metadata
--- ---------------------------------------------------------------------------
-
-CREATE TABLE capture_metadata (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id        INTEGER NOT NULL,
-    final_url       TEXT,
-    http_status     INTEGER,
-    content_type    TEXT,
-    screenshot_path TEXT,
-    page_title      TEXT,
-    captured_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (entry_id) REFERENCES entry(id) ON DELETE CASCADE
-);
+CREATE INDEX capture_url_key_idx   ON capture (url_key);
+CREATE INDEX capture_timestamp_idx ON capture (timestamp);
+CREATE INDEX capture_status_size_idx ON capture (status, size_bytes);
 
 -- ---------------------------------------------------------------------------
 -- Tags
@@ -120,27 +62,16 @@ CREATE TABLE capture_metadata (
 
 CREATE TABLE tag (
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE
+    name TEXT NOT NULL UNIQUE                  -- lowercase, no commas
 );
 
-CREATE TABLE entry_tag (
-    entry_id INTEGER NOT NULL,
-    tag_id   INTEGER NOT NULL,
+CREATE TABLE capture_tag (
+    capture_id INTEGER NOT NULL,
+    tag_id     INTEGER NOT NULL,
 
-    PRIMARY KEY (entry_id, tag_id),
-    FOREIGN KEY (entry_id) REFERENCES entry(id) ON DELETE CASCADE,
-    FOREIGN KEY (tag_id)   REFERENCES tag(id)   ON DELETE CASCADE
+    PRIMARY KEY (capture_id, tag_id),
+    FOREIGN KEY (capture_id) REFERENCES capture(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id)     REFERENCES tag(id)     ON DELETE CASCADE
 );
 
--- ---------------------------------------------------------------------------
--- Entry notes
--- ---------------------------------------------------------------------------
-
-CREATE TABLE entry_note (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id   INTEGER NOT NULL,
-    body       TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (entry_id) REFERENCES entry(id) ON DELETE CASCADE
-);
+CREATE INDEX capture_tag_tag_idx ON capture_tag (tag_id);

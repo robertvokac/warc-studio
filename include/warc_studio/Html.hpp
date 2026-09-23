@@ -1,79 +1,71 @@
 #pragma once
 
+#include "warc_studio/Database.hpp"
 #include "warc_studio/Models.hpp"
-#include "warc_studio/HttpUtil.hpp"
 
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace warc_studio {
 
-// Status badge HTML helper
-std::string statusBadge(const std::string& status);
+// Page: Save Page Now + recent captures (/)
+struct HomeView {
+    std::string url;                         // prefilled URL (e.g. from the bookmarklet)
+    std::string title;                       // prefilled title
+    std::string tags;                        // prefilled tags
+    std::vector<Capture> existingCaptures;   // captures of `url`, when given
+    std::vector<Capture> recentCaptures;
+    std::vector<TagCount> allTags;
+    ArchiveStats stats;
+    std::optional<std::string> message;
+};
+std::string renderHomePage(const HomeView& view);
 
-// Page: Collections list (/collections)
-std::string renderCollectionsPage(
-    const std::vector<Collection>& collections,
-    const std::optional<std::string>& message,
-    const std::string& activeNav = "collections"
-);
+// Page: bulk save (/save/bulk)
+std::string renderBulkSavePage(const std::vector<TagCount>& allTags, const std::optional<std::string>& message);
 
-// Page: Entries list for a collection (/collections/<id>/entries or /entries?collection_id=X)
-std::string renderEntriesPage(
-    const std::optional<Collection>& currentCollection,
-    const std::vector<Collection>& allCollections,
-    const std::vector<Entry>& entries,
-    const std::optional<std::string>& message,
-    const std::string& activeNav = "entries"
-);
+// Page: browse and search captures (/captures)
+struct BrowseView {
+    CaptureQuery query;
+    std::string tagText;                     // raw tag filter text for the form
+    std::vector<Capture> captures;
+    int total{};
+    int page{1};
+    int pageSize{50};
+    std::vector<TagCount> allTags;
+    std::optional<std::string> message;
+};
+std::string renderBrowsePage(const BrowseView& view);
 
-// Page: Entry detail (/entry/<id>)
-std::string renderEntryDetailPage(
-    const Entry& entry,
-    const std::vector<ArchiveFile>& archiveFiles,
-    const std::vector<CrawlRun>& crawlRuns,
-    const std::optional<std::string>& message
-);
+// Page: all captures of one URL (/url?url=...), like the Wayback Machine calendar
+std::string renderUrlPage(const std::string& url, const std::vector<Capture>& captures,
+                          const std::vector<TagCount>& allTags, const std::optional<std::string>& message);
 
-// Page: Archive files for a collection (/collections/<id>/archives)
-std::string renderArchiveFilesPage(
-    const std::optional<Collection>& currentCollection,
-    const std::vector<Collection>& allCollections,
-    const std::vector<ArchiveFile>& archiveFiles,
-    const std::vector<Entry>& entries,
-    const std::optional<std::string>& message
-);
+// Page: capture detail (/capture/<id>)
+std::string renderCapturePage(const Capture& capture, const std::string& logTail,
+                              const std::vector<TagCount>& allTags, const std::optional<std::string>& message);
 
-// Page: Replay embed — serves ReplayWeb.page web component on our HTTP origin
-// so there is no mixed-content issue when the WACZ is also on HTTP.
-std::string renderReplayPage(
-    const std::string& sourceUrl,   // full http://host/archives/... URL
-    const std::string& title        // page title / label
-);
+// Page: tags (/tags)
+std::string renderTagsPage(const std::vector<TagCount>& tags, const std::optional<std::string>& message);
 
-// Page: Settings / About (/about)
-std::string renderAboutPage(
-    const std::string& dataDir,
-    const std::string& browsertrixImage,
-    bool runBrowsertrix,
-    const std::string& appVersion
-);
+// Page: upload own WARC/WACZ (/upload)
+std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::optional<std::string>& message);
 
-// Legacy pages — kept for backward compatibility during transition
-std::string renderIndexPage(
-    const std::vector<Collection>& collections,
-    const std::vector<Entry>& entries,
-    const std::map<int, ArchiveFile>& latestArchiveFiles,
-    const std::optional<std::string>& message
-);
+// Page: replay a capture with ReplayWeb.page (/capture/<id>/replay)
+std::string renderReplayPage(const Capture& capture, const std::string& archiveSource);
 
-std::string renderCollectionDetailPage(
-    const Collection& collection,
-    const std::vector<Entry>& entries,
-    const std::map<int, ArchiveFile>& latestArchiveFiles,
-    const std::optional<std::string>& message
-);
+// Page: settings / about (/about)
+struct AboutView {
+    std::string appVersion;
+    std::string dataDir;
+    std::string userAgent;
+    int crawlWorkers{};
+    int crawlTimeLimitSeconds{};
+    std::int64_t maxResourceBytes{};
+    std::string baseUrl;
+    ArchiveStats stats;
+};
+std::string renderAboutPage(const AboutView& view);
 
 } // namespace warc_studio

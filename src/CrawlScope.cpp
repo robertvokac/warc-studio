@@ -1,6 +1,9 @@
-#include "warc_studio/CaptureDepthPolicy.hpp"
+#include "warc_studio/CrawlScope.hpp"
+#include "warc_studio/CaptureUtil.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -94,49 +97,91 @@ std::string basePrefixFromPath(const std::string& path) {
     return path.substr(0, slash + 1); // includes the trailing '/'
 }
 
+// Multi-tenant hosting domains: every subdomain belongs to someone else, so they act as public suffixes.
+constexpr std::array kHostingSuffixes = {
+    "github.io", "gitlab.io", "blogspot.com", "wordpress.com", "tumblr.com", "substack.com",
+    "netlify.app", "vercel.app", "pages.dev", "web.app", "firebaseapp.com", "herokuapp.com",
+    "neocities.org", "wixsite.com", "weebly.com", "webnode.cz", "blog.cz",
+};
+
+// Second-level labels used under country TLDs, e.g. "co.uk", "com.au", "ac.jp".
+constexpr std::array kSecondLevelLabels = {"co", "com", "net", "org", "gov", "ac", "edu", "or", "ne", "go", "mil"};
+
+bool endsWithLabel(std::string_view host, std::string_view suffix) {
+    return host == suffix
+        || (host.size() > suffix.size() && host.ends_with(suffix) && host[host.size() - suffix.size() - 1] == '.');
+}
+
 } // namespace
+
+std::string siteDomain(std::string_view host) {
+    std::string h(host);
+    std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (h.empty() || h.front() == '[' || std::all_of(h.begin(), h.end(), [](unsigned char c) {
+            return std::isdigit(c) || c == '.';
+        })) {
+        return h;  // IP address
+    }
+
+    std::vector<std::string_view> labels;
+    std::string_view rest(h);
+    while (!rest.empty()) {
+        const auto dot = rest.find('.');
+        labels.push_back(rest.substr(0, dot));
+        rest = dot == std::string_view::npos ? std::string_view{} : rest.substr(dot + 1);
+    }
+
+    // Number of labels forming the public suffix.
+    std::size_t suffixLabels = 1;
+    for (const std::string_view suffix : kHostingSuffixes) {
+        if (endsWithLabel(h, suffix)) {
+            suffixLabels = static_cast<std::size_t>(std::count(suffix.begin(), suffix.end(), '.')) + 1;
+            break;
+        }
+    }
+    if (suffixLabels == 1 && labels.size() >= 3 && labels.back().size() == 2
+        && std::find(kSecondLevelLabels.begin(), kSecondLevelLabels.end(), labels[labels.size() - 2])
+               != kSecondLevelLabels.end()) {
+        suffixLabels = 2;
+    }
+    if (labels.size() <= suffixLabels + 1) {
+        return h;
+    }
+    std::string domain;
+    for (std::size_t i = labels.size() - suffixLabels - 1; i < labels.size(); ++i) {
+        if (!domain.empty()) domain += '.';
+        domain += labels[i];
+    }
+    return domain;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-bool isCrawlUrlAllowed(const std::string& startUrl,
-                       const std::string& candidateUrl,
-                       CaptureDepth depth) {
+bool isInCrawlScope(const std::string& startUrl, const std::string& candidateUrl, CrawlScope scope) {
     // Strip fragments from both URLs before any comparison.
     const std::string start = stripFragment(startUrl);
     const std::string candidate = stripFragment(candidateUrl);
 
-    if (depth == CaptureDepth::CURRENT_PAGE_ONLY) {
-        // Strip query string from both for identity comparison.
-        // We compare scheme+host+path only — query strings are stripped so that
-        // e.g. "https://example.com/page?lang=en" is still considered the same page.
-        auto pathOnly = [](const std::string& u) -> std::string {
-            const auto sep = u.find("://");
-            if (sep == std::string::npos) return u;
-            const auto hostStart = sep + 3;
-            const auto pathStart = u.find('/', hostStart);
-            const auto qmark = u.find('?');
-            const std::size_t end = (qmark != std::string::npos) ? qmark : u.size();
-            const std::string path = (pathStart != std::string::npos && pathStart < end)
-                ? u.substr(pathStart, end - pathStart)
-                : "/";
-            const std::string host = u.substr(hostStart,
-                (pathStart != std::string::npos ? pathStart : end) - hostStart);
-            return u.substr(0, sep) + "://" + host + path;
-        };
-        return pathOnly(start) == pathOnly(candidate);
-    }
-
-    // CURRENT_PAGE_AND_SUBPAGES
     const std::string startScheme = extractScheme(start);
     const std::string candScheme  = extractScheme(candidate);
-    if (startScheme.empty() || candScheme.empty()) return false;
-    if (startScheme != candScheme) return false;
+    const auto isHttp = [](const std::string& scheme) { return scheme == "http" || scheme == "https"; };
+    if (!isHttp(startScheme) || !isHttp(candScheme)) return false;
 
     const std::string startHost = extractHost(start);
     const std::string candHost  = extractHost(candidate);
     if (startHost.empty() || candHost.empty()) return false;
+
+    if (scope == CrawlScope::ANY) {
+        return true;
+    }
+    if (scope == CrawlScope::DOMAIN) {
+        return endsWithLabel(urlHost(candidate), siteDomain(urlHost(start)));
+    }
+
+    // PREFIX
+    if (startScheme != candScheme) return false;
     if (startHost != candHost) return false;
 
     const std::string startPath = normalisePath(extractPath(start));

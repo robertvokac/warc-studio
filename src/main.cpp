@@ -1,4 +1,5 @@
-#include "warc_studio/BrowsertrixService.hpp"
+#include "warc_studio/CaptureUtil.hpp"
+#include "warc_studio/CrawlService.hpp"
 #include "warc_studio/Database.hpp"
 #include "warc_studio/FileService.hpp"
 #include "warc_studio/Html.hpp"
@@ -6,6 +7,8 @@
 
 #include <crow.h>
 #include <crow/multipart.h>
+#include <curl/curl.h>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -19,14 +22,18 @@
 #  include <unistd.h>
 #endif
 #include <iostream>
-#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 // Application version string
-static constexpr const char* kAppVersion = "0.2.0";
+static constexpr const char* kAppVersion = "0.4.0";
+
+// Many sites serve reduced pages or block unknown clients, so the crawler presents itself as a browser.
+static constexpr const char* kDefaultUserAgent =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 "
+    "warc-studio/0.4";
 
 // ---------------------------------------------------------------------------
 // CORS middleware — injects full CORS + Private Network Access headers on
@@ -57,6 +64,11 @@ struct CorsMw {
 
 namespace {
 
+using warc_studio::Capture;
+using warc_studio::CrawlScope;
+using warc_studio::CaptureQuery;
+using FormFields = std::unordered_map<std::string, std::string>;
+
 std::filesystem::path environmentPathOrDefault(const char* name, const std::filesystem::path& fallback) {
     const char* value = std::getenv(name);
     if (value == nullptr || std::string(value).empty()) {
@@ -73,14 +85,13 @@ std::string environmentStringOrDefault(const char* name, const std::string& fall
     return value;
 }
 
-std::uint16_t environmentPortOrDefault(const char* name, std::uint16_t fallback) {
+int environmentIntOrDefault(const char* name, int fallback) {
     const char* value = std::getenv(name);
     if (value == nullptr || std::string(value).empty()) {
         return fallback;
     }
-    return static_cast<std::uint16_t>(std::stoi(value));
+    return std::stoi(value);
 }
-
 
 std::optional<std::filesystem::path> executableDirectory() {
 #if defined(_WIN32)
@@ -165,36 +176,85 @@ crow::response redirectTo(const std::string& location) {
     return response;
 }
 
-crow::response redirectWithMessage(const std::string& message) {
-    return redirectTo("/?message=" + warc_studio::urlEncode(message));
-}
-
-crow::response redirectWithMessageTo(const std::string& base, const std::string& message) {
-    const bool hasQuery = base.find('?') != std::string::npos;
-    const std::string sep = hasQuery ? "&" : "?";
+crow::response redirectWithMessage(const std::string& base, const std::string& message) {
+    const std::string sep = base.find('?') != std::string::npos ? "&" : "?";
     return redirectTo(base + sep + "message=" + warc_studio::urlEncode(message));
 }
 
-std::optional<std::string> optionalTextField(
-    const std::unordered_map<std::string, std::string>& form,
-    const std::string& key
-) {
-    const auto it = form.find(key);
-    if (it == form.end() || it->second.empty()) {
-        return std::nullopt;
-    }
-    return it->second;
+std::string captureHref(int id) {
+    return "/capture/" + std::to_string(id);
 }
 
-std::string requiredTextField(
-    const std::unordered_map<std::string, std::string>& form,
-    const std::string& key
-) {
+std::string urlHistoryHref(const std::string& url) {
+    return "/url?url=" + warc_studio::urlEncode(url);
+}
+
+std::optional<std::string> queryMessage(const crow::request& request) {
+    const char* message = request.url_params.get("message");
+    return message == nullptr ? std::nullopt : std::optional<std::string>{message};
+}
+
+std::string queryParam(const crow::request& request, const char* name) {
+    const char* value = request.url_params.get(name);
+    return value == nullptr ? std::string{} : std::string(value);
+}
+
+std::string formField(const FormFields& form, const std::string& key) {
     const auto it = form.find(key);
-    if (it == form.end() || it->second.empty()) {
-        throw std::runtime_error("Missing required form field: " + key);
+    return it == form.end() ? std::string{} : it->second;
+}
+
+std::optional<std::string> optionalFormField(const FormFields& form, const std::string& key) {
+    const auto value = formField(form, key);
+    return value.empty() ? std::nullopt : std::optional<std::string>{value};
+}
+
+// Normalizes a user supplied URL and rejects anything that is not http(s).
+std::string requireHttpUrl(const std::string& input) {
+    const std::string url = warc_studio::normalizeInputUrl(input);
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+        throw std::runtime_error("Only http:// and https:// URLs can be archived: " + input);
     }
-    return it->second;
+    const auto host = warc_studio::urlHost(url);
+    const bool validHost = !host.empty() && std::all_of(host.begin(), host.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == '[' || c == ']' || c >= 0x80;
+    });
+    const bool hasSpace = std::any_of(url.begin(), url.end(), [](unsigned char c) { return c <= ' '; });
+    if (!validHost || hasSpace) {
+        throw std::runtime_error("Not a valid URL: " + input);
+    }
+    return url;
+}
+
+int intFormField(const FormFields& form, const std::string& key, int fallback) {
+    const auto value = formField(form, key);
+    if (value.empty()) return fallback;
+    try {
+        return std::stoi(value);
+    } catch (const std::exception&) {
+        throw std::runtime_error("Not a number in field " + key + ": " + value);
+    }
+}
+
+// A new crawl request built from the save form fields (url, tags, title, max_depth, crawl_scope, page_limit).
+Capture crawlRequest(const std::string& url, const FormFields& form) {
+    Capture capture;
+    capture.url = url;
+    capture.timestamp = warc_studio::nowTimestamp();
+    capture.title = optionalFormField(form, "title");
+    capture.status = "queued";
+    capture.source = "crawl";
+    capture.maxDepth = std::clamp(intFormField(form, "max_depth", 0),
+                                  warc_studio::kUnlimitedDepth, warc_studio::kMaxCrawlDepth);
+    if (capture.maxDepth != 0) {
+        capture.scope = warc_studio::crawlScopeFromString(formField(form, "crawl_scope"));
+        capture.pageLimit = std::max(0, intFormField(form, "page_limit", 0));
+        if (capture.scope == CrawlScope::ANY && capture.maxDepth == warc_studio::kUnlimitedDepth) {
+            throw std::runtime_error("Following links to any site needs a limited depth.");
+        }
+    }
+    capture.tags = warc_studio::parseTags(formField(form, "tags"));
+    return capture;
 }
 
 std::string requestBaseUrl(const crow::request& request) {
@@ -209,19 +269,27 @@ std::string requestBaseUrl(const crow::request& request) {
     return scheme + "://" + host;
 }
 
-// Build the latestArchiveFiles map used by legacy page renderers.
-std::map<int, warc_studio::ArchiveFile> buildLatestArchiveFiles(
-    warc_studio::Database& database,
-    const std::vector<warc_studio::Entry>& entries
-) {
-    std::map<int, warc_studio::ArchiveFile> result;
-    for (const auto& entry : entries) {
-        const auto af = database.getLatestArchiveFile(entry.id);
-        if (af) {
-            result.emplace(entry.id, *af);
-        }
+std::string isoTimestamp(const std::string& ts) {
+    if (!warc_studio::isTimestamp(ts)) return ts;
+    auto formatted = warc_studio::formatTimestamp(ts);
+    formatted[10] = 'T';
+    return formatted + "Z";
+}
+
+// Last ~16 KB of a crawl log, starting at a line boundary.
+std::string readLogTail(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return {};
+    file.seekg(0, std::ios::end);
+    const auto size = static_cast<std::int64_t>(file.tellg());
+    const std::int64_t start = std::max<std::int64_t>(0, size - 16 * 1024);
+    file.seekg(start);
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (start > 0) {
+        const auto newline = text.find('\n');
+        text = "…\n" + (newline == std::string::npos ? text : text.substr(newline + 1));
     }
-    return result;
+    return text;
 }
 
 // Serve a static file from the static/ directory relative to the project root.
@@ -253,22 +321,24 @@ crow::response serveStaticFile(const std::string& relativePath,
 int main() {
     try {
         const auto dataRoot = environmentPathOrDefault("WARC_STUDIO_DATA_DIR", "data");
-        const auto browsertrixImage = environmentStringOrDefault(
-            "WARC_STUDIO_BROWSERTRIX_IMAGE", "webrecorder/browsertrix-crawler:latest");
-        const auto port = environmentPortOrDefault("WARC_STUDIO_PORT", 18080);
-        const char* runBrowsertrixEnv = std::getenv("WARC_STUDIO_RUN_BROWSERTRIX");
-        const bool runBrowsertrix = runBrowsertrixEnv == nullptr
-            ? true
-            : warc_studio::isTruthyEnvironmentValue(runBrowsertrixEnv);
+        const auto port = static_cast<std::uint16_t>(environmentIntOrDefault("WARC_STUDIO_PORT", 18080));
+        warc_studio::CrawlConfig crawlConfig{
+            .userAgent = environmentStringOrDefault("WARC_STUDIO_USER_AGENT", kDefaultUserAgent),
+            .workers = environmentIntOrDefault("WARC_STUDIO_CRAWL_WORKERS", 2),
+            .timeLimitSeconds = environmentIntOrDefault("WARC_STUDIO_CRAWL_TIME_LIMIT", 0),
+            .maxResourceBytes = std::int64_t{environmentIntOrDefault("WARC_STUDIO_MAX_RESOURCE_MB", 100)} * 1024 * 1024,
+        };
+        // libcurl must be initialized before any thread uses it.
+        curl_global_init(CURL_GLOBAL_DEFAULT);
 
         // Static files root: prefer static/ next to the executable, with an explicit
         // WARC_STUDIO_STATIC_DIR override and a CWD fallback for development runs.
         const auto staticRoot = findStaticRoot();
-        std::cout << "Static assets root: " << staticRoot << "\n";
 
         warc_studio::Database database(dataRoot / "warc-studio.sqlite3");
         warc_studio::FileService fileService(dataRoot);
-        warc_studio::BrowsertrixService browsertrix(fileService, browsertrixImage, runBrowsertrix);
+        warc_studio::CrawlService crawler(database, fileService, crawlConfig);
+        crawler.start();
 
         crow::App<CorsMw> app;
 
@@ -276,7 +346,6 @@ int main() {
         // Static assets
         // -----------------------------------------------------------------------
 
-        // Serve individual well-known static assets explicitly.
         // Note: Crow 1.2.0 does not support two GET routes with <path> at the same depth,
         // so we cannot use /static/<path> alongside /archives/<path>. Use explicit routes instead.
         CROW_ROUTE(app, "/favicon.svg")(
@@ -303,65 +372,35 @@ int main() {
         //   /static/ui.js  — alternate path kept for backward compatibility.
         //   /static/sw.js  — alternate path kept for backward compatibility.
         //   /sw.js         — root-scope SW kept for any old cached registrations.
-        CROW_ROUTE(app, "/replay/ui.js")(
-            [&staticRoot]() {
+        for (const char* route : {"/replay/ui.js", "/static/ui.js"}) {
+            app.route_dynamic(route)([&staticRoot]() {
                 auto res = serveStaticFile("ui.js", "application/javascript; charset=utf-8", staticRoot);
                 res.add_header("Cache-Control", "no-store");
                 return res;
-            }
-        );
-
-        CROW_ROUTE(app, "/replay/sw.js")(
-            [&staticRoot]() {
+            });
+        }
+        for (const char* route : {"/replay/sw.js", "/static/sw.js", "/sw.js"}) {
+            app.route_dynamic(route)([&staticRoot]() {
                 auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
                 res.add_header("Cache-Control", "no-store");
                 return res;
-            }
-        );
+            });
+        }
 
-        CROW_ROUTE(app, "/static/ui.js")(
-            [&staticRoot]() {
-                auto res = serveStaticFile("ui.js", "application/javascript; charset=utf-8", staticRoot);
-                res.add_header("Cache-Control", "no-store");
-                return res;
-            }
-        );
-
-        CROW_ROUTE(app, "/static/sw.js")(
-            [&staticRoot]() {
-                auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
-                res.add_header("Cache-Control", "no-store");
-                return res;
-            }
-        );
-
-        // /replay/ and /replay — app shell required by ReplayWeb.page service worker.
+        // /replay/ — app shell required by ReplayWeb.page service worker.
         // When the SW intercepts /replay/?source=... on first load, the browser may
         // fall through to the server. Crow must return a valid HTML page (not 404).
-        auto replayShellHandler = [](const crow::request& req) {
-            std::string query = req.raw_url;
-            std::cerr << "REPLAY SHELL REQUEST:\n"
-                      << "  path = " << req.url << "\n"
-                      << "  query = " << query << "\n";
-            const std::string html =
-                "<!doctype html>\n"
-                "<html>\n"
-                "<head>\n"
-                "  <meta charset=\"utf-8\">\n"
+        auto replayShellHandler = []() {
+            crow::response res(200,
+                "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n"
                 "  <title>warc-studio replay shell</title>\n"
-                "  <script src=\"/replay/ui.js\"></script>\n"
-                "</head>\n"
-                "<body>\n"
-                "  <replay-app-main></replay-app-main>\n"
-                "</body>\n"
-                "</html>\n";
-            crow::response res(200, html);
+                "  <script src=\"/replay/ui.js\"></script>\n</head>\n"
+                "<body>\n  <replay-app-main></replay-app-main>\n</body>\n</html>\n");
             res.add_header("Content-Type", "text/html; charset=utf-8");
             res.add_header("Cache-Control", "no-store");
             return res;
         };
         // Crow treats /replay and /replay/ as the same route — register only one.
-        // The browser requests /replay/?source=... (with trailing slash).
         CROW_ROUTE(app, "/replay/")(replayShellHandler);
 
         // Catch-all for /replay/<path> sub-paths (e.g. /replay/w/<ts>/<url>).
@@ -370,868 +409,450 @@ int main() {
         // is installed/active), these requests fall through to the server.
         // Returning the shell HTML allows the SW to register and take over.
         CROW_ROUTE(app, "/replay/<path>")(
-            [replayShellHandler](const crow::request& req, const std::string& /*subPath*/) {
-                return replayShellHandler(req);
-            }
+            [replayShellHandler](const std::string& /*subPath*/) { return replayShellHandler(); }
         );
-
-        // /sw.js — root-scope backward-compat: serves same local sw.js file.
-        CROW_ROUTE(app, "/sw.js")(
-            [&staticRoot]() {
-                auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
-                res.add_header("Cache-Control", "no-store");
-                return res;
-            }
-        );
-
-        // -----------------------------------------------------------------------
-        // Root / legacy index page
-        // -----------------------------------------------------------------------
-
-        CROW_ROUTE(app, "/")([&database](const crow::request& request) {
-            const char* message = request.url_params.get("message");
-            const auto entries = database.listEntries();
-            const auto latestArchiveFiles = buildLatestArchiveFiles(database, entries);
-            return htmlResponse(warc_studio::renderIndexPage(
-                database.listCollections(),
-                entries,
-                latestArchiveFiles,
-                message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message}
-            ));
-        });
 
         CROW_ROUTE(app, "/health")([] {
             return crow::response(200, "ok");
         });
 
         // -----------------------------------------------------------------------
-        // Collections section
+        // Save Page Now
         // -----------------------------------------------------------------------
 
-        CROW_ROUTE(app, "/collections")([&database](const crow::request& request) {
-            const char* message = request.url_params.get("message");
-            return htmlResponse(warc_studio::renderCollectionsPage(
-                database.listCollections(),
-                message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message}
-            ));
+        CROW_ROUTE(app, "/")([&database](const crow::request& request) {
+            warc_studio::HomeView view;
+            view.url = queryParam(request, "url");
+            view.title = queryParam(request, "title");
+            view.tags = queryParam(request, "tags");
+            if (!view.url.empty()) {
+                view.existingCaptures = database.listCapturesForUrlKey(
+                    warc_studio::makeUrlKey(warc_studio::normalizeInputUrl(view.url)));
+            }
+            CaptureQuery recent;
+            recent.limit = 20;
+            view.recentCaptures = database.findCaptures(recent);
+            view.allTags = database.listTagCounts();
+            view.stats = database.stats();
+            view.message = queryMessage(request);
+            return htmlResponse(warc_studio::renderHomePage(view));
         });
 
-        CROW_ROUTE(app, "/collection/new").methods(crow::HTTPMethod::POST)(
+        CROW_ROUTE(app, "/save").methods(crow::HTTPMethod::POST)(
+            [&database, &crawler](const crow::request& request) {
+                const auto form = warc_studio::parseUrlEncoded(request.body);
+                try {
+                    const auto url = requireHttpUrl(formField(form, "url"));
+                    const int id = database.insertCapture(crawlRequest(url, form));
+                    crawler.notify();
+                    return redirectWithMessage(captureHref(id), "Queued for archiving: " + url);
+                } catch (const std::exception& error) {
+                    return redirectWithMessage("/?url=" + warc_studio::urlEncode(formField(form, "url")),
+                                               std::string("Error: ") + error.what());
+                }
+            }
+        );
+
+        CROW_ROUTE(app, "/save/bulk")([&database](const crow::request& request) {
+            return htmlResponse(warc_studio::renderBulkSavePage(database.listTagCounts(), queryMessage(request)));
+        });
+
+        CROW_ROUTE(app, "/save/bulk").methods(crow::HTTPMethod::POST)(
+            [&database, &crawler](const crow::request& request) {
+                try {
+                    const auto form = warc_studio::parseUrlEncoded(request.body);
+                    const bool skipArchived = !formField(form, "skip_archived").empty();
+                    int queued = 0, skipped = 0;
+                    std::vector<std::string> invalid;
+                    std::istringstream lines(formField(form, "urls"));
+                    for (std::string line; std::getline(lines, line);) {
+                        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+                        std::string url;
+                        try {
+                            url = requireHttpUrl(line);
+                        } catch (const std::exception&) {
+                            invalid.push_back(line);
+                            continue;
+                        }
+                        if (skipArchived) {
+                            const auto existing = database.listCapturesForUrlKey(warc_studio::makeUrlKey(url));
+                            const bool archived = std::any_of(existing.begin(), existing.end(), [](const Capture& c) {
+                                return c.status == "archived" || c.status == "queued" || c.status == "crawling";
+                            });
+                            if (archived) {
+                                ++skipped;
+                                continue;
+                            }
+                        }
+                        database.insertCapture(crawlRequest(url, form));
+                        ++queued;
+                    }
+                    crawler.notify();
+                    std::string message = "Queued " + std::to_string(queued) + " URLs";
+                    if (skipped > 0) message += ", skipped " + std::to_string(skipped) + " already archived";
+                    if (!invalid.empty()) message += ", ignored " + std::to_string(invalid.size()) + " invalid lines";
+                    return redirectWithMessage("/captures", message + ".");
+                } catch (const std::exception& error) {
+                    return redirectWithMessage("/save/bulk", std::string("Error: ") + error.what());
+                }
+            }
+        );
+
+        // JSON: is this URL archived already? Used by the Save Page Now form while typing.
+        CROW_ROUTE(app, "/api/lookup")([&database](const crow::request& request) {
+            const auto url = queryParam(request, "url");
+            const auto captures = database.listCapturesForUrlKey(
+                warc_studio::makeUrlKey(warc_studio::normalizeInputUrl(url)));
+            crow::json::wvalue json;
+            json["url_key"] = warc_studio::makeUrlKey(warc_studio::normalizeInputUrl(url));
+            json["count"] = static_cast<int>(captures.size());
+            json["archived"] = static_cast<int>(std::count_if(captures.begin(), captures.end(),
+                [](const Capture& c) { return c.status == "archived"; }));
+            if (!captures.empty()) {
+                const auto& last = captures.front();
+                json["last"]["id"] = last.id;
+                json["last"]["timestamp"] = last.timestamp;
+                json["last"]["iso"] = isoTimestamp(last.timestamp);
+                json["last"]["status"] = last.status;
+                crow::json::wvalue::list tags;
+                for (const auto& tag : last.tags) tags.emplace_back(tag);
+                json["last"]["tags"] = std::move(tags);
+            }
+            crow::response response(json);
+            response.add_header("Cache-Control", "no-store");
+            return response;
+        });
+
+        // -----------------------------------------------------------------------
+        // Browse / search
+        // -----------------------------------------------------------------------
+
+        CROW_ROUTE(app, "/captures")([&database](const crow::request& request) {
+            warc_studio::BrowseView view;
+            view.query.urlContains = queryParam(request, "q");
+            view.tagText = queryParam(request, "tag");
+            view.query.tags = warc_studio::parseTags(view.tagText);
+            view.query.status = queryParam(request, "status");
+            view.query.oldestFirst = queryParam(request, "order") == "oldest";
+            try {
+                view.page = std::max(1, std::stoi(queryParam(request, "page")));
+            } catch (const std::exception&) {
+                view.page = 1;
+            }
+            view.query.limit = view.pageSize;
+            view.query.offset = (view.page - 1) * view.pageSize;
+            view.captures = database.findCaptures(view.query);
+            view.total = database.countCaptures(view.query);
+            view.allTags = database.listTagCounts();
+            view.message = queryMessage(request);
+            return htmlResponse(warc_studio::renderBrowsePage(view));
+        });
+
+        CROW_ROUTE(app, "/url")([&database](const crow::request& request) {
+            const auto input = queryParam(request, "url");
+            if (input.empty()) {
+                return redirectTo("/captures");
+            }
+            const auto url = warc_studio::normalizeInputUrl(input);
+            const auto captures = database.listCapturesForUrlKey(warc_studio::makeUrlKey(url));
+            return htmlResponse(warc_studio::renderUrlPage(
+                captures.empty() ? url : captures.front().url, captures, database.listTagCounts(),
+                queryMessage(request)));
+        });
+
+        // Wayback Machine style URLs:
+        //   /web/*/<url>          -> all captures of the URL
+        //   /web/<timestamp>/<url> -> replay of the capture closest to the timestamp
+        //   /web/<url>            -> replay of the latest capture
+        CROW_ROUTE(app, "/web/<path>")([&database](const crow::request& request, const std::string& /*path*/) {
+            // raw_url keeps the query string of the archived URL.
+            std::string rest = request.raw_url.substr(std::string("/web/").size());
+            std::string timestamp;
+            const auto slash = rest.find('/');
+            const std::string first = rest.substr(0, slash);
+            if (first == "*" || (!first.empty() && std::isdigit(static_cast<unsigned char>(first.front()))
+                                 && first.find('.') == std::string::npos)) {
+                timestamp = first;
+                rest = slash == std::string::npos ? std::string{} : rest.substr(slash + 1);
+            }
+            // Proxies and browsers sometimes collapse "https://" to "https:/".
+            for (const std::string scheme : {"http:/", "https:/"}) {
+                if (rest.rfind(scheme, 0) == 0 && rest.compare(scheme.size(), 1, "/") != 0) {
+                    rest.insert(scheme.size(), "/");
+                }
+            }
+            if (rest.empty()) {
+                return redirectTo("/captures");
+            }
+            const auto url = warc_studio::normalizeInputUrl(warc_studio::urlDecode(rest));
+            if (timestamp == "*") {
+                return redirectTo(urlHistoryHref(url));
+            }
+            std::string digits;
+            for (const char c : timestamp) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) break;
+                digits.push_back(c);
+            }
+            digits = digits.substr(0, 14);
+            while (!digits.empty() && digits.size() < 14) digits.push_back('0');
+            const auto capture = database.findNearestCapture(
+                warc_studio::makeUrlKey(url), digits.empty() ? warc_studio::nowTimestamp() : digits);
+            if (!capture) {
+                return redirectWithMessage(urlHistoryHref(url), "This URL has no archived capture yet.");
+            }
+            return redirectTo(captureHref(capture->id) + "/replay");
+        });
+
+        // -----------------------------------------------------------------------
+        // Capture detail and actions
+        // -----------------------------------------------------------------------
+
+        CROW_ROUTE(app, "/capture/<int>")(
+            [&database, &crawler](const crow::request& request, int id) {
+                const auto capture = database.getCapture(id);
+                if (!capture) {
+                    return crow::response(404, "Capture not found");
+                }
+                return htmlResponse(warc_studio::renderCapturePage(
+                    *capture, readLogTail(crawler.logPath(id)), database.listTagCounts(), queryMessage(request)));
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/update").methods(crow::HTTPMethod::POST)(
+            [&database](const crow::request& request, int id) {
+                try {
+                    const auto form = warc_studio::parseUrlEncoded(request.body);
+                    database.updateCaptureDetails(id, requireHttpUrl(formField(form, "url")),
+                                                  optionalFormField(form, "title"), optionalFormField(form, "note"),
+                                                  warc_studio::parseTags(formField(form, "tags")));
+                    return redirectWithMessage(captureHref(id), "Capture was updated.");
+                } catch (const std::exception& error) {
+                    return redirectWithMessage(captureHref(id), std::string("Error: ") + error.what());
+                }
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/cancel").methods(crow::HTTPMethod::POST)(
+            [&database](int id) {
+                const bool cancelled = database.cancelQueuedCapture(id);
+                return redirectWithMessage(captureHref(id),
+                    cancelled ? "Capture was cancelled." : "The crawl has already started; use Stop crawl.");
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/stop").methods(crow::HTTPMethod::POST)(
+            [&database, &crawler](int id) {
+                const auto capture = database.getCapture(id);
+                if (!capture || capture->status != "crawling") {
+                    return redirectWithMessage(captureHref(id), "This capture is not crawling.");
+                }
+                crawler.requestStop(id);
+                return redirectWithMessage(captureHref(id),
+                    "Stopping the crawl; the pages captured so far will be saved.");
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/retry").methods(crow::HTTPMethod::POST)(
+            [&database, &crawler](int id) {
+                database.requeueCapture(id);
+                crawler.notify();
+                return redirectWithMessage(captureHref(id), "Capture was queued again.");
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/recapture").methods(crow::HTTPMethod::POST)(
+            [&database, &crawler](int id) {
+                const auto original = database.getCapture(id);
+                if (!original) {
+                    return crow::response(404, "Capture not found");
+                }
+                Capture capture;
+                capture.url = original->url;
+                capture.timestamp = warc_studio::nowTimestamp();
+                capture.status = "queued";
+                capture.source = "crawl";
+                capture.maxDepth = original->maxDepth;
+                capture.scope = original->scope;
+                capture.pageLimit = original->pageLimit;
+                capture.tags = original->tags;
+                const int newId = database.insertCapture(capture);
+                crawler.notify();
+                return redirectWithMessage(captureHref(newId), "Queued a new capture of " + capture.url);
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/delete").methods(crow::HTTPMethod::POST)(
+            [&database, &fileService, &crawler](int id) {
+                const auto capture = database.getCapture(id);
+                if (!capture) {
+                    return redirectTo("/captures");
+                }
+                if (capture->status == "crawling") {
+                    return redirectWithMessage(captureHref(id), "Error: stop the crawl before deleting the capture.");
+                }
+                try {
+                    fileService.deleteStoredArchiveIfPresent(capture->filePath);
+                    std::error_code ec;
+                    std::filesystem::remove(crawler.logPath(id), ec);
+                    database.deleteCapture(id);
+                    return redirectWithMessage(urlHistoryHref(capture->url), "Capture was deleted.");
+                } catch (const std::exception& error) {
+                    return redirectWithMessage(captureHref(id), std::string("Error: ") + error.what());
+                }
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/replay")(
+            [&database, &fileService](int id) {
+                const auto capture = database.getCapture(id);
+                if (!capture) {
+                    return crow::response(404, "Capture not found");
+                }
+                if (capture->status != "archived" || !capture->filePath) {
+                    return redirectWithMessage(captureHref(id), "This capture has no archive file to replay yet.");
+                }
+                return htmlResponse(warc_studio::renderReplayPage(
+                    *capture, fileService.publicArchivePath(*capture->filePath)));
+            }
+        );
+
+        CROW_ROUTE(app, "/capture/<int>/download")(
+            [&database, &fileService](int id) {
+                const auto capture = database.getCapture(id);
+                if (!capture || !capture->filePath) {
+                    return crow::response(404, "Archive file not found");
+                }
+                try {
+                    return fileService.downloadArchive(*capture->filePath, warc_studio::captureDownloadName(*capture));
+                } catch (const std::exception& error) {
+                    return crow::response(400, error.what());
+                }
+            }
+        );
+
+        // -----------------------------------------------------------------------
+        // Tags
+        // -----------------------------------------------------------------------
+
+        CROW_ROUTE(app, "/tags")([&database](const crow::request& request) {
+            return htmlResponse(warc_studio::renderTagsPage(database.listTagCounts(), queryMessage(request)));
+        });
+
+        CROW_ROUTE(app, "/tags/rename").methods(crow::HTTPMethod::POST)(
             [&database](const crow::request& request) {
                 try {
                     const auto form = warc_studio::parseUrlEncoded(request.body);
-                    const std::string name = requiredTextField(form, "name");
-                    const auto description = optionalTextField(form, "description");
-                    database.createCollection(name, description);
-                    return redirectWithMessageTo("/collections", "Collection was created.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessageTo("/collections", std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        CROW_ROUTE(app, "/collection/<int>")(
-            [&database](const crow::request& request, int collectionId) {
-                const auto collection = database.getCollection(collectionId);
-                if (!collection) {
-                    return crow::response(404, "Collection not found");
-                }
-                const char* message = request.url_params.get("message");
-                const auto entries = database.listEntriesByCollection(collectionId);
-                const auto latestArchiveFiles = buildLatestArchiveFiles(database, entries);
-                return htmlResponse(warc_studio::renderCollectionDetailPage(
-                    *collection,
-                    entries,
-                    latestArchiveFiles,
-                    message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message}
-                ));
-            }
-        );
-
-        // GET /collections/<id>/entries — collection-scoped entries view
-        CROW_ROUTE(app, "/collections/<int>/entries")(
-            [&database](const crow::request& request, int collectionId) {
-                const auto collection = database.getCollection(collectionId);
-                const char* message = request.url_params.get("message");
-                const std::optional<std::string> msg =
-                    message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message};
-                const auto entries = collection
-                    ? database.listEntriesByCollection(collectionId)
-                    : std::vector<warc_studio::Entry>{};
-                return htmlResponse(warc_studio::renderEntriesPage(
-                    collection, database.listCollections(), entries, msg
-                ));
-            }
-        );
-
-        CROW_ROUTE(app, "/collection/<int>/edit").methods(crow::HTTPMethod::POST)(
-            [&database](const crow::request& request, int collectionId) {
-                try {
-                    const auto form = warc_studio::parseUrlEncoded(request.body);
-                    const std::string name = requiredTextField(form, "name");
-                    const auto description = optionalTextField(form, "description");
-                    database.updateCollection(collectionId, name, description);
-                    return redirectWithMessageTo(
-                        "/collection/" + std::to_string(collectionId), "Collection was updated.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessageTo(
-                        "/collection/" + std::to_string(collectionId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        CROW_ROUTE(app, "/collection/<int>/delete").methods(crow::HTTPMethod::POST)(
-            [&database, &fileService](int collectionId) {
-                try {
-                    const auto entries = database.listEntriesByCollection(collectionId);
-                    for (const auto& entry : entries) {
-                        const auto archiveFiles = database.listArchiveFilesForEntry(entry.id);
-                        for (const auto& af : archiveFiles) {
-                            fileService.deleteStoredArchiveIfPresent(af.path);
-                        }
-                        if (entry.warcPath && !entry.warcPath->empty()) {
-                            fileService.deleteStoredArchiveIfPresent(entry.warcPath);
-                        }
+                    const auto to = warc_studio::parseTags(formField(form, "to"));
+                    if (to.size() != 1) {
+                        throw std::runtime_error("The new tag name must be a single non-empty tag.");
                     }
-                    database.deleteCollection(collectionId);
-                    return redirectWithMessageTo("/collections", "Collection was deleted.");
+                    database.renameTag(formField(form, "from"), to.front());
+                    return redirectWithMessage("/tags", "Tag was renamed to \"" + to.front() + "\".");
                 } catch (const std::exception& error) {
-                    return redirectWithMessageTo("/collections", std::string("Error: ") + error.what());
+                    return redirectWithMessage("/tags", std::string("Error: ") + error.what());
                 }
             }
         );
 
-        // -----------------------------------------------------------------------
-        // Entries section
-        // -----------------------------------------------------------------------
-
-        // GET /entries — entries view; collection_id from query param
-        CROW_ROUTE(app, "/entries")([&database](const crow::request& request) {
-            const char* collIdParam = request.url_params.get("collection_id");
-            const char* message = request.url_params.get("message");
-            const std::optional<std::string> msg =
-                message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message};
-
-            const auto allCollections = database.listCollections();
-
-            std::optional<warc_studio::Collection> currentCollection;
-            std::vector<warc_studio::Entry> entries;
-
-            if (collIdParam != nullptr && std::string(collIdParam) != "0") {
-                const int collId = std::stoi(collIdParam);
-                currentCollection = database.getCollection(collId);
-                if (currentCollection) {
-                    entries = database.listEntriesByCollection(collId);
-                }
-            } else if (!allCollections.empty()) {
-                // Auto-select first collection when none specified.
-                currentCollection = allCollections.front();
-                entries = database.listEntriesByCollection(currentCollection->id);
-            }
-
-            return htmlResponse(warc_studio::renderEntriesPage(
-                currentCollection, allCollections, entries, msg
-            ));
-        });
-
-        CROW_ROUTE(app, "/entry/new").methods(crow::HTTPMethod::POST)(
+        CROW_ROUTE(app, "/tags/delete").methods(crow::HTTPMethod::POST)(
             [&database](const crow::request& request) {
-                try {
-                    const auto form = warc_studio::parseUrlEncoded(request.body);
-                    const int collectionId = std::stoi(requiredTextField(form, "collection_id"));
-                    const std::string url = requiredTextField(form, "url");
-                    const auto title = optionalTextField(form, "title");
-                    const std::string depthStr = optionalTextField(form, "capture_depth").value_or("CURRENT_PAGE_ONLY");
-                    const warc_studio::CaptureDepth captureDepth = warc_studio::captureDepthFromString(depthStr);
-                    const int entryId = database.createEntry(collectionId, url, title, captureDepth);
-                    return redirectWithMessageTo(
-                        "/collections/" + std::to_string(collectionId) + "/entries",
-                        "Entry was created.");
-                    (void)entryId;
-                } catch (const std::exception& error) {
-                    return redirectWithMessage(std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // GET /entry/<id> — entry detail page
-        CROW_ROUTE(app, "/entry/<int>")(
-            [&database](const crow::request& request, int entryId) {
-                const auto entry = database.getEntry(entryId);
-                if (!entry) {
-                    return crow::response(404, "Entry not found");
-                }
-                const char* message = request.url_params.get("message");
-                const auto archiveFiles = database.listArchiveFilesForEntry(entryId);
-                const auto crawlRuns = database.listCrawlRunsForEntry(entryId);
-                return htmlResponse(warc_studio::renderEntryDetailPage(
-                    *entry, archiveFiles, crawlRuns,
-                    message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message}
-                ));
-            }
-        );
-
-        // POST /entry/<id>/update — edit entry fields (url, title, note)
-        CROW_ROUTE(app, "/entry/<int>/update").methods(crow::HTTPMethod::POST)(
-            [&database](const crow::request& request, int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (!entry) {
-                        return redirectWithMessage("Entry was not found.");
-                    }
-                    const auto form = warc_studio::parseUrlEncoded(request.body);
-                    const std::string url = requiredTextField(form, "url");
-                    const std::string title = optionalTextField(form, "title").value_or("");
-                    const std::string note = optionalTextField(form, "note").value_or("");
-                    const std::string depthStr = optionalTextField(form, "capture_depth").value_or("CURRENT_PAGE_ONLY");
-                    const warc_studio::CaptureDepth captureDepth = warc_studio::captureDepthFromString(depthStr);
-                    database.updateEntry(entryId, url, title, note, captureDepth);
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId), "Entry was updated.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // POST /entry/<id>/status — change status manually
-        CROW_ROUTE(app, "/entry/<int>/status").methods(crow::HTTPMethod::POST)(
-            [&database](const crow::request& request, int entryId) {
-                try {
-                    const auto form = warc_studio::parseUrlEncoded(request.body);
-                    const std::string status = requiredTextField(form, "status");
-                    database.updateEntryStatus(entryId, status);
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId), "Status was updated.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // POST /entry/<id>/start — start Browsertrix recording
-        CROW_ROUTE(app, "/entry/<int>/start").methods(crow::HTTPMethod::POST)(
-            [&database, &browsertrix](int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (!entry) {
-                        return redirectWithMessage("Entry was not found.");
-                    }
-
-                    const auto result = browsertrix.startRecording(*entry);
-
-                    const int crawlRunId = database.createCrawlRun(
-                        entryId,
-                        result.browsertrixId,
-                        result.dockerContainerName.empty()
-                            ? std::optional<std::string>{}
-                            : std::optional<std::string>{result.dockerContainerName}
-                    );
-                    database.updateCrawlRunStarted(crawlRunId);
-                    database.updateEntryStatus(entryId, "recording");
-                    database.setEntryBrowsertrixId(entryId, result.browsertrixId);
-
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId), result.message);
-                } catch (const std::exception& error) {
-                    database.setEntryError(entryId, error.what());
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // POST /entry/<id>/stop — stop Browsertrix recording
-        CROW_ROUTE(app, "/entry/<int>/stop").methods(crow::HTTPMethod::POST)(
-            [&database, &browsertrix, &fileService](int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (!entry) {
-                        return redirectWithMessage("Entry was not found.");
-                    }
-
-                    // Resolve the active crawl run before stopping so we can update it.
-                    const auto activeCrawlRun = database.getLatestActiveCrawlRunForEntry(entryId);
-
-                    const auto result = browsertrix.stopRecording(*entry);
-
-                    if (!result.storedWaczPath.empty()) {
-                        const std::string sha256 = fileService.computeSha256(result.storedWaczPath);
-                        database.addArchiveFile(
-                            entryId, result.storedWaczPath, "wacz",
-                            std::string{"browsertrix recording"},
-                            std::string{"browsertrix"},
-                            std::nullopt,
-                            sha256.empty() ? std::optional<std::string>{} : std::optional<std::string>{sha256}
-                        );
-                        database.markEntryArchived(entryId);
-                        database.setEntryWarcPath(entryId, result.storedWaczPath);
-                    }
-
-                    // Mark the crawl run as finished.
-                    if (activeCrawlRun) {
-                        database.updateCrawlRunStopped(activeCrawlRun->id, "finished",
-                                                       std::optional<int>{0}, std::nullopt);
-                    }
-
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId), result.message);
-                } catch (const std::exception& error) {
-                    database.setEntryError(entryId, error.what());
-                    // Mark the crawl run as failed if one was active.
-                    const auto activeCrawlRun = database.getLatestActiveCrawlRunForEntry(entryId);
-                    if (activeCrawlRun) {
-                        database.updateCrawlRunStopped(activeCrawlRun->id, "failed",
-                                                       std::nullopt, std::string{error.what()});
-                    }
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // GET /entry/<id>/check — check if Browsertrix container finished; auto-stop if done
-        CROW_ROUTE(app, "/entry/<int>/check")(
-            [&database, &browsertrix, &fileService](const crow::request& /*req*/, int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (!entry) {
-                        return redirectWithMessage("Entry was not found.");
-                    }
-
-                    if (entry->status != "recording") {
-                        return redirectWithMessageTo(
-                            "/entry/" + std::to_string(entryId),
-                            "Entry is not currently recording (status: " + entry->status + ").");
-                    }
-
-                    const std::string browsertrixId = entry->browsertrixId.value_or(
-                        "crawl_entry_" + std::to_string(entry->id));
-
-                    if (!browsertrix.isContainerFinished(browsertrixId)) {
-                        return redirectWithMessageTo(
-                            "/entry/" + std::to_string(entryId),
-                            "Browsertrix container is still running. Check again later.");
-                    }
-
-                    // Container finished — run the same stop logic as POST /entry/<id>/stop.
-                    const auto activeCrawlRun = database.getLatestActiveCrawlRunForEntry(entryId);
-                    const auto result = browsertrix.stopRecording(*entry);
-
-                    if (!result.storedWaczPath.empty()) {
-                        const std::string sha256 = fileService.computeSha256(result.storedWaczPath);
-                        database.addArchiveFile(
-                            entryId, result.storedWaczPath, "wacz",
-                            std::string{"browsertrix recording"},
-                            std::string{"browsertrix"},
-                            std::nullopt,
-                            sha256.empty() ? std::optional<std::string>{}
-                                           : std::optional<std::string>{sha256}
-                        );
-                        database.markEntryArchived(entryId);
-                        database.setEntryWarcPath(entryId, result.storedWaczPath);
-                    }
-
-                    if (activeCrawlRun) {
-                        database.updateCrawlRunStopped(activeCrawlRun->id, "finished",
-                                                       std::optional<int>{0}, std::nullopt);
-                    }
-
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        "Crawl completed. " + result.message);
-                } catch (const std::exception& error) {
-                    database.setEntryError(entryId, error.what());
-                    const auto activeCrawlRun = database.getLatestActiveCrawlRunForEntry(entryId);
-                    if (activeCrawlRun) {
-                        database.updateCrawlRunStopped(activeCrawlRun->id, "failed",
-                                                       std::nullopt, std::string{error.what()});
-                    }
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // POST /entry/<id>/upload — upload a WARC/WACZ file
-        CROW_ROUTE(app, "/entry/<int>/upload").methods(crow::HTTPMethod::POST)(
-            [&database, &fileService](const crow::request& request, int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (!entry) {
-                        return redirectWithMessage("Entry was not found.");
-                    }
-
-                    // Parse multipart form using Crow's structured multipart API.
-                    crow::multipart::message mp(request);
-
-                    // Retrieve the "file" part via the part_map (keyed by the name parameter).
-                    const auto filePart = mp.get_part_by_name("file");
-                    const auto labelPart = mp.get_part_by_name("label");
-
-                    const std::string& fileBody = filePart.body;
-                    const std::string label = labelPart.body;
-
-                    // Extract the original filename from the Content-Disposition params.
-                    const auto& cd = filePart.get_header_object("Content-Disposition");
-                    const auto fnIt = cd.params.find("filename");
-                    const std::string filename = (fnIt != cd.params.end()) ? fnIt->second : std::string{};
-
-                    if (filename.empty() || fileBody.empty()) {
-                        return redirectWithMessageTo(
-                            "/entry/" + std::to_string(entryId),
-                            "Error: No file was uploaded or file is empty.");
-                    }
-
-                    const auto uploadResult = fileService.saveUploadedArchive(
-                        entry->collectionId, entryId, filename, fileBody);
-
-                    if (!uploadResult.success) {
-                        return redirectWithMessageTo(
-                            "/entry/" + std::to_string(entryId),
-                            "Error: " + uploadResult.errorMessage);
-                    }
-
-                    const std::optional<std::string> labelOpt =
-                        label.empty() ? std::optional<std::string>{"manual upload"}
-                                      : std::optional<std::string>{label};
-
-                    database.addArchiveFile(
-                        entryId, uploadResult.storedPath, uploadResult.fileType,
-                        labelOpt,
-                        std::string{"manual_upload"},
-                        uploadResult.sizeBytes,
-                        uploadResult.sha256.empty()
-                            ? std::optional<std::string>{}
-                            : std::optional<std::string>{uploadResult.sha256}
-                    );
-                    database.markEntryImportedIfNew(entryId);
-
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        "Archive file was uploaded successfully.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId),
-                        std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // GET /entry/<id>/replay/latest — replay the latest WACZ for an entry
-        CROW_ROUTE(app, "/entry/<int>/replay/latest")(
-            [&database](int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (!entry) {
-                        return crow::response(404, "Entry not found");
-                    }
-
-                    const auto archiveFile = database.getLatestWaczArchiveFile(entryId);
-                    if (!archiveFile) {
-                        return crow::response(404,
-                            "<html><body><p>No WACZ archive file is available for this entry. "
-                            "Record or upload a WACZ first.</p></body></html>");
-                    }
-
-                    // Redirect to the per-archive local embed replay page.
-                    crow::response res(302);
-                    res.add_header("Location",
-                        "/archive/" + std::to_string(archiveFile->id) + "/replay");
-                    return res;
-                } catch (const std::exception& error) {
-                    return crow::response(500, error.what());
-                }
-            }
-        );
-
-        // Legacy replay route — kept for backward compatibility
-        CROW_ROUTE(app, "/entry/<int>/replay")(
-            [&database](int entryId) {
-                try {
-                    const auto archiveFile = database.getLatestWaczArchiveFile(entryId);
-                    if (!archiveFile) {
-                        return crow::response(404,
-                            "<html><body><p>No archive file is available for this entry.</p></body></html>");
-                    }
-                    // Redirect to the per-archive local embed replay page.
-                    crow::response res(302);
-                    res.add_header("Location",
-                        "/archive/" + std::to_string(archiveFile->id) + "/replay");
-                    return res;
-                } catch (const std::exception& error) {
-                    return crow::response(500, error.what());
-                }
-            }
-        );
-
-        // GET /archive/<id>/replay/local — local fallback replay page showing source URL and download link
-        CROW_ROUTE(app, "/archive/<int>/replay/local")(
-            [&database, &fileService](const crow::request& request, int archiveFileId) {
-                try {
-                    const auto archiveFile = database.getArchiveFileById(archiveFileId);
-                    if (!archiveFile) {
-                        return crow::response(404, "Archive file not found");
-                    }
-
-                    const std::string sourceUrl = requestBaseUrl(request)
-                        + fileService.publicArchivePath(archiveFile->path);
-                    const std::string replayWebUrl = "https://replayweb.page/?source="
-                        + warc_studio::urlEncode(sourceUrl);
-
-                    std::ostringstream html;
-                    html << "<!DOCTYPE html><html lang=\"en\"><head>";
-                    html << "<meta charset=\"UTF-8\"><title>Replay info — warc-studio</title>";
-                    html << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">";
-                    html << "<link rel=\"stylesheet\" href=\"/static/style.css\">";
-                    html << "</head><body>";
-                    html << "<header class=\"site-header\"><a class=\"brand\" href=\"/\">warc-studio</a></header>";
-                    html << "<div class=\"container\">";
-                    html << "<h2>Replay: " << warc_studio::htmlEscape(archiveFile->path) << "</h2>";
-                    html << "<table class=\"table\">";
-                    html << "<tr><th>Archive file ID</th><td>" << archiveFile->id << "</td></tr>";
-                    html << "<tr><th>Path</th><td class=\"mono\">" << warc_studio::htmlEscape(archiveFile->path) << "</td></tr>";
-                    html << "<tr><th>File type</th><td>" << warc_studio::htmlEscape(archiveFile->fileType) << "</td></tr>";
-                    html << "<tr><th>Archive serve URL</th><td><a href=\"" << warc_studio::htmlEscape(sourceUrl)
-                         << "\" target=\"_blank\" class=\"mono\">" << warc_studio::htmlEscape(sourceUrl) << "</a></td></tr>";
-                    if (archiveFile->fileType == "wacz") {
-                        html << "<tr><th>Open in ReplayWeb.page</th><td>";
-                        html << "<a href=\"" << warc_studio::htmlEscape(replayWebUrl)
-                             << "\" target=\"_blank\" class=\"btn\">Open in ReplayWeb.page (external)</a>";
-                        html << "</td></tr>";
-                    }
-                    html << "</table>";
-                    html << "<p><a href=\"" << warc_studio::htmlEscape(sourceUrl)
-                         << "\" download class=\"btn\">&#11015; Download archive file</a></p>";
-                    html << "<p><a href=\"/archive/" << archiveFile->id
-                         << "/replay\" class=\"btn-secondary\">Try embedded replay</a></p>";
-                    html << "</div></body></html>";
-                    return htmlResponse(html.str());
-                } catch (const std::exception& error) {
-                    return crow::response(500, error.what());
-                }
-            }
-        );
-
-        // GET /archive/<id>/replay — replay a specific archive file.
-        // Serves an inline HTML page with the <replay-web-page> web component.
-        // The WACZ source is a same-origin relative URL (/archives/...) — no mixed-content,
-        // no cross-origin issues, no redirect to external paths.
-        // replayBase="/replay/" tells the component to load its SW from /replay/sw.js;
-        // in embed="default" mode the actual replay runs inside an iframe rooted at /replay/
-        // so the SW scope /replay/ covers it correctly even though this page is at /archive/<id>/replay.
-        CROW_ROUTE(app, "/archive/<int>/replay")(
-            [&database, &fileService](const crow::request& request, int archiveFileId) {
-                try {
-                    const auto archiveFile = database.getArchiveFileById(archiveFileId);
-                    if (!archiveFile) {
-                        return crow::response(404, "Archive file not found");
-                    }
-                    if (archiveFile->fileType != "wacz") {
-                        return htmlResponse(
-                            "<html><body><p>WARC replay is not supported yet. "
-                            "Only WACZ files can be replayed.</p></body></html>");
-                    }
-
-                    // Relative same-origin source path for the WACZ file.
-                    // Must NOT be a localhost absolute URL — keep it relative so it works
-                    // regardless of the host/port the app runs on.
-                    const std::string waczSource =
-                        fileService.publicArchivePath(archiveFile->path);
-
-                    // Determine the original archived URL to replay.
-                    // Priority: explicit ?url= query param → entry seed URL from DB → none (show index).
-                    // The url attribute must be the ORIGINAL archived URL (e.g. https://example.com/),
-                    // never a local application path like /archives/... or http://localhost/...
-                    std::string replayUrl;
-                    const char* urlParam = request.url_params.get("url");
-                    if (urlParam != nullptr && std::string(urlParam) != "") {
-                        replayUrl = std::string(urlParam);
-                    }
-
-                    // Logging: print all relevant info to stdout for diagnostics.
-                    std::cout << "REPLAY DEBUG:\n"
-                              << "  archiveId       = " << archiveFileId << "\n"
-                              << "  archive_file.id = " << archiveFile->id << "\n"
-                              << "  archive_file.path = " << archiveFile->path << "\n"
-                              << "  wacz_source     = " << waczSource << "  (relative same-origin path)\n"
-                              << "  replay_url      = " << (replayUrl.empty() ? "(none — will show pages index)" : replayUrl) << "\n"
-                              << std::flush;
-                    if (replayUrl.empty()) {
-                        std::cout << "  replay_url      = (none, url attribute omitted, ReplayWeb.page should show WACZ index)\n";
-                    }
-
-                    std::ostringstream html;
-                    html << "<!doctype html>\n<html lang=\"en\">\n<head>\n";
-                    html << "<meta charset=\"utf-8\">\n";
-                    html << "<title>Replay: "
-                         << warc_studio::htmlEscape(archiveFile->label.value_or(archiveFile->path))
-                         << " — warc-studio</title>\n";
-                    html << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n";
-                    // ui.js is loaded from /replay/ui.js — same path as replayBase so SW registration works.
-                    html << "<script src=\"/replay/ui.js\"></script>\n";
-                    html << "<style>\n"
-                         << "html,body{margin:0;padding:0;width:100%;height:100%;}\n"
-                         << "replay-web-page{display:block;width:100%;height:100vh;}\n"
-                         << ".replay-bar{background:#1a1a2e;color:#eee;padding:6px 12px;"
-                         << "font-family:sans-serif;font-size:13px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;}\n"
-                         << ".replay-bar a{color:#90caf9;text-decoration:none;}\n"
-                         << ".replay-bar .replay-url{color:#aed6a0;word-break:break-all;}\n"
-                         << "</style>\n";
-                    html << "</head>\n<body>\n";
-                    html << "<div class=\"replay-bar\">\n";
-                    html << "<a href=\"/entry/" << archiveFile->entryId << "\">&larr; Back</a>\n";
-                    html << "<span>Replaying: "
-                         << warc_studio::htmlEscape(archiveFile->label.value_or(archiveFile->path))
-                         << "</span>\n";
-                    if (!replayUrl.empty()) {
-                        html << "<span class=\"replay-url\">URL: "
-                             << warc_studio::htmlEscape(replayUrl) << "</span>\n";
-                    }
-                    html << "<a href=\"" << warc_studio::htmlEscape(waczSource)
-                         << "\" download>&#11015; Download WACZ</a>\n";
-                    html << "<a href=\"/archive/" << archiveFileId << "/debug/wacz\" style=\"color:#ffeb3b\">[Debug WACZ]</a>\n";
-                    // HTML comment with diagnostic info.
-                    html << "<!-- REPLAY: archive_file.id=" << archiveFile->id
-                         << " wacz_source=" << warc_studio::htmlEscape(waczSource)
-                         << " replay_url=" << warc_studio::htmlEscape(replayUrl) << " -->\n";
-                    html << "</div>\n";
-                    // <replay-web-page> web component:
-                    // - source: relative path to WACZ (same-origin, no mixed-content)
-                    // - url: original archived URL (from DB or query param); omit to show pages index
-                    // - replayBase: where to find ui.js and sw.js (must match where SW is served)
-                    // - embed="default": renders inside an iframe scoped to replayBase — SW scope covers it
-                    html << "<replay-web-page\n"
-                         << "  source=\"" << warc_studio::htmlEscape(waczSource) << "\"\n";
-                    if (!replayUrl.empty()) {
-                        html << "  url=\"" << warc_studio::htmlEscape(replayUrl) << "\"\n";
-                    }
-                    html << "  replayBase=\"/replay/\"\n"
-                         << "  embed=\"default\">\n"
-                         << "</replay-web-page>\n";
-                    html << "</body>\n</html>\n";
-                    return htmlResponse(html.str());
-                } catch (const std::exception& error) {
-                    return crow::response(500, error.what());
-                }
-            }
-        );
-
-        // GET /archive/<id>/debug/wacz — diagnostic endpoint for WACZ files.
-        CROW_ROUTE(app, "/archive/<int>/debug/wacz")(
-            [&database, &fileService](const crow::request&, int archiveFileId) {
-                try {
-                    const auto af = database.getArchiveFileById(archiveFileId);
-                    if (!af) return crow::response(404, "Archive file not found");
-
-                    std::ostringstream out;
-                    out << "<html><head><title>Debug WACZ: " << archiveFileId << "</title>";
-                    out << "<style>body{font-family:monospace;white-space:pre;padding:20px;background:#1e1e1e;color:#d4d4d4;}";
-                    out << "h1{color:#569cd6;} h2{color:#ce9178;margin-top:2em; border-bottom:1px solid #333;}";
-                    out << ".ok{color:#4ec9b0;} .err{color:#f44747;}</style></head><body>";
-                    out << "<h1>Debug WACZ: " << archiveFileId << "</h1>";
-
-                    // 1. Database Record
-                    out << "<h2>1. Database Record (archive_file)</h2>";
-                    out << "ID:         " << af->id << "\n";
-                    out << "Entry ID:   " << af->entryId << "\n";
-                    out << "Path:       " << af->path << "\n";
-                    out << "File Type:  " << af->fileType << "\n";
-                    out << "Label:      " << af->label.value_or("(none)") << "\n";
-
-                    const auto entry = database.getEntry(af->entryId);
-                    if (entry) {
-                        out << "\n<h2>Entry DB Record</h2>";
-                        out << "Entry ID:   " << entry->id << "\n";
-                        out << "Seed URL:   " << entry->url << "\n";
-                        out << "Status:     " << entry->status << "\n";
-                    }
-
-                    // 2. Physical File
-                    out << "<h2>2. Physical File</h2>";
-                    std::filesystem::path fullPath = fileService.dataRoot() / af->path;
-                    out << "Absolute Path: " << fullPath.string() << "\n";
-                    if (std::filesystem::exists(fullPath)) {
-                        out << "Exists:        <span class='ok'>YES</span>\n";
-                        out << "Size:          " << std::filesystem::file_size(fullPath) << " bytes\n";
-
-                        // Read first 4 bytes for ZIP signature
-                        std::ifstream fs(fullPath, std::ios::binary);
-                        char buf[4];
-                        if (fs.read(buf, 4)) {
-                            out << "Header (hex):  ";
-                            for(int i=0; i<4; ++i) {
-                                out << std::hex << std::setw(2) << std::setfill('0') << (static_cast<int>(buf[i]) & 0xff) << " ";
-                            }
-                            out << std::dec << "\n";
-                            if (buf[0] == 'P' && buf[1] == 'K') {
-                                out << "Signature:     <span class='ok'>PK (ZIP)</span>\n";
-                            } else {
-                                out << "Signature:     <span class='err'>UNKNOWN (Not a ZIP)</span>\n";
-                            }
-                        }
-                    } else {
-                        out << "Exists:        <span class='err'>NO (File missing on disk)</span>\n";
-                    }
-
-                    // 3. WACZ Public Serving
-                    out << "<h2>3. Public Serving</h2>";
-                    out << "Source URL:    " << fileService.publicArchivePath(af->path) << "\n";
-
-                    // 4. ZIP Contents & Index (via unzip)
-                    out << "<h2>4. ZIP Contents (unzip -l)</h2>";
-                    std::string cmdL = "unzip -l \"" + fullPath.string() + "\" 2>&1";
-                    FILE* pipeL = popen(cmdL.c_str(), "r");
-                    if (pipeL) {
-                        char buffer[128];
-                        while (fgets(buffer, sizeof(buffer), pipeL) != NULL) out << buffer;
-                        pclose(pipeL);
-                    }
-
-                    out << "<h2>5. CDXJ Index (first 20 lines)</h2>";
-                    std::string cmdI = "unzip -p \"" + fullPath.string() + "\" indexes/index.cdxj 2>/dev/null | head -20";
-                    FILE* pipeI = popen(cmdI.c_str(), "r");
-                    if (pipeI) {
-                        char buffer[256];
-                        while (fgets(buffer, sizeof(buffer), pipeI) != NULL) out << buffer;
-                        pclose(pipeI);
-                    }
-
-                    out << "<h2>6. Datapackage.json</h2>";
-                    std::string cmdD = "unzip -p \"" + fullPath.string() + "\" datapackage.json 2>/dev/null";
-                    FILE* pipeD = popen(cmdD.c_str(), "r");
-                    if (pipeD) {
-                        char buffer[256];
-                        while (fgets(buffer, sizeof(buffer), pipeD) != NULL) out << buffer;
-                        pclose(pipeD);
-                    }
-
-                    out << "</body></html>";
-                    return htmlResponse(out.str());
-                } catch (const std::exception& e) {
-                    return crow::response(500, std::string("Debug failed: ") + e.what());
-                }
-            }
-        );
-
-        // POST /archive/<id>/update — edit archive file label
-        CROW_ROUTE(app, "/archive/<int>/update").methods(crow::HTTPMethod::POST)(
-            [&database](const crow::request& request, int archiveFileId) {
-                try {
-                    const auto af = database.getArchiveFileById(archiveFileId);
-                    if (!af) {
-                        return redirectWithMessage("Archive file was not found.");
-                    }
-                    const auto form = warc_studio::parseUrlEncoded(request.body);
-                    const std::string label = optionalTextField(form, "label").value_or("");
-                    database.updateArchiveFileLabel(archiveFileId, label);
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(af->entryId), "Archive file label was updated.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessage(std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // POST /archive/<id>/delete — delete a single archive file
-        CROW_ROUTE(app, "/archive/<int>/delete").methods(crow::HTTPMethod::POST)(
-            [&database, &fileService](int archiveFileId) {
-                try {
-                    const auto af = database.getArchiveFileById(archiveFileId);
-                    if (!af) {
-                        return redirectWithMessage("Archive file was not found.");
-                    }
-                    const int entryId = af->entryId;
-                    fileService.deleteStoredArchiveIfPresent(af->path);
-                    database.deleteArchiveFile(archiveFileId);
-                    return redirectWithMessageTo(
-                        "/entry/" + std::to_string(entryId), "Archive file was deleted.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessage(std::string("Error: ") + error.what());
-                }
-            }
-        );
-
-        // POST /entry/<id>/delete — delete an entry
-        CROW_ROUTE(app, "/entry/<int>/delete").methods(crow::HTTPMethod::POST)(
-            [&database, &fileService](int entryId) {
-                try {
-                    const auto entry = database.getEntry(entryId);
-                    if (entry) {
-                        const auto archiveFiles = database.listArchiveFilesForEntry(entryId);
-                        for (const auto& af : archiveFiles) {
-                            fileService.deleteStoredArchiveIfPresent(af.path);
-                        }
-                        if (entry->warcPath && !entry->warcPath->empty()) {
-                            fileService.deleteStoredArchiveIfPresent(entry->warcPath);
-                        }
-                        const int collId = entry->collectionId;
-                        database.deleteEntry(entryId);
-                        return redirectWithMessageTo(
-                            "/collections/" + std::to_string(collId) + "/entries",
-                            "Entry was deleted.");
-                    }
-                    return redirectWithMessage("Entry was not found.");
-                } catch (const std::exception& error) {
-                    return redirectWithMessage(std::string("Error: ") + error.what());
-                }
+                const auto form = warc_studio::parseUrlEncoded(request.body);
+                database.deleteTag(formField(form, "name"));
+                return redirectWithMessage("/tags", "Tag was deleted.");
             }
         );
 
         // -----------------------------------------------------------------------
-        // Archive files browser
+        // Upload of own WARC/WACZ files
         // -----------------------------------------------------------------------
 
-        CROW_ROUTE(app, "/archives-browser")([&database](const crow::request& request) {
-            const char* collIdParam = request.url_params.get("collection_id");
-            const char* message = request.url_params.get("message");
-            const std::optional<std::string> msg =
-                message == nullptr ? std::optional<std::string>{} : std::optional<std::string>{message};
-
-            const auto allCollections = database.listCollections();
-
-            std::optional<warc_studio::Collection> currentCollection;
-            std::vector<warc_studio::ArchiveFile> archiveFiles;
-            std::vector<warc_studio::Entry> entries;
-
-            if (collIdParam != nullptr && std::string(collIdParam) != "0") {
-                const int collId = std::stoi(collIdParam);
-                currentCollection = database.getCollection(collId);
-                if (currentCollection) {
-                    archiveFiles = database.listArchiveFilesForCollection(collId);
-                    entries = database.listEntriesByCollection(collId);
-                }
-            } else if (!allCollections.empty()) {
-                currentCollection = allCollections.front();
-                archiveFiles = database.listArchiveFilesForCollection(currentCollection->id);
-                entries = database.listEntriesByCollection(currentCollection->id);
-            }
-
-            return htmlResponse(warc_studio::renderArchiveFilesPage(
-                currentCollection, allCollections, archiveFiles, entries, msg
-            ));
+        CROW_ROUTE(app, "/upload")([&database](const crow::request& request) {
+            return htmlResponse(warc_studio::renderUploadPage(database.listTagCounts(), queryMessage(request)));
         });
+
+        CROW_ROUTE(app, "/upload").methods(crow::HTTPMethod::POST)(
+            [&database, &fileService](const crow::request& request) {
+                std::optional<std::string> storedPath;
+                try {
+                    crow::multipart::message multipart(request);
+                    const auto field = [&multipart](const char* name) {
+                        auto value = multipart.get_part_by_name(name).body;
+                        // Browsers send CRLF line breaks in textareas.
+                        std::erase(value, '\r');
+                        return value;
+                    };
+                    const auto filePart = multipart.get_part_by_name("file");
+                    const auto& disposition = filePart.get_header_object("Content-Disposition");
+                    const auto filenameIt = disposition.params.find("filename");
+                    const std::string filename = filenameIt == disposition.params.end() ? "" : filenameIt->second;
+                    if (filename.empty() || filePart.body.empty()) {
+                        throw std::runtime_error("No file was uploaded or the file is empty.");
+                    }
+
+                    std::string timestamp = warc_studio::parseTimestamp(field("timestamp"));
+                    if (!field("timestamp").empty() && timestamp.empty()) {
+                        throw std::runtime_error("Could not understand the capture date \"" + field("timestamp") + "\".");
+                    }
+                    auto stored = fileService.storeUploadedArchive(
+                        timestamp.empty() ? warc_studio::nowTimestamp() : timestamp, filename, filePart.body);
+                    storedPath = stored.storedPath;
+
+                    const auto info = fileService.inspectArchive(stored.storedPath);
+                    std::string url = field("url");
+                    if (url.empty()) url = info.url;
+                    if (url.empty()) {
+                        throw std::runtime_error("Could not detect the URL from the file; please fill it in.");
+                    }
+                    url = requireHttpUrl(url);
+                    if (timestamp.empty() && !info.timestamp.empty()) {
+                        // Name the file after the capture date found inside it.
+                        timestamp = info.timestamp;
+                        stored = fileService.storeArchiveFile(
+                            timestamp, fileService.absoluteArchivePath(stored.storedPath));
+                        storedPath = stored.storedPath;
+                    }
+
+                    Capture capture;
+                    capture.url = url;
+                    capture.timestamp = timestamp.empty() ? warc_studio::nowTimestamp() : timestamp;
+                    capture.title = field("title").empty()
+                        ? (info.title.empty() ? std::nullopt : std::optional<std::string>{info.title})
+                        : std::optional<std::string>{field("title")};
+                    capture.note = field("note").empty() ? std::nullopt : std::optional<std::string>{field("note")};
+                    capture.status = "archived";
+                    capture.source = "upload";
+                    capture.filePath = stored.storedPath;
+                    capture.fileType = stored.fileType;
+                    capture.sizeBytes = stored.sizeBytes;
+                    if (!stored.sha256.empty()) capture.sha256 = stored.sha256;
+                    capture.tags = warc_studio::parseTags(field("tags"));
+                    const int id = database.insertCapture(capture);
+                    return redirectWithMessage(captureHref(id), "Archive file was uploaded.");
+                } catch (const std::exception& error) {
+                    if (storedPath) {
+                        try { fileService.deleteStoredArchiveIfPresent(storedPath); } catch (...) {}
+                    }
+                    return redirectWithMessage("/upload", std::string("Error: ") + error.what());
+                }
+            }
+        );
 
         // -----------------------------------------------------------------------
         // About page
         // -----------------------------------------------------------------------
 
         CROW_ROUTE(app, "/about")(
-            [&dataRoot, &browsertrixImage, runBrowsertrix]() {
-                return htmlResponse(warc_studio::renderAboutPage(
-                    std::filesystem::absolute(dataRoot).string(),
-                    browsertrixImage,
-                    runBrowsertrix,
-                    kAppVersion
-                ));
+            [&database, &fileService, &crawler](const crow::request& request) {
+                return htmlResponse(warc_studio::renderAboutPage(warc_studio::AboutView{
+                    .appVersion = kAppVersion,
+                    .dataDir = fileService.dataRoot().string(),
+                    .userAgent = crawler.config().userAgent,
+                    .crawlWorkers = crawler.config().workers,
+                    .crawlTimeLimitSeconds = crawler.config().timeLimitSeconds,
+                    .maxResourceBytes = crawler.config().maxResourceBytes,
+                    .baseUrl = requestBaseUrl(request),
+                    .stats = database.stats(),
+                }));
             }
         );
 
@@ -1258,8 +879,9 @@ int main() {
         );
 
         std::cout << "warc-studio is listening on http://localhost:" << port << "/\n";
-        std::cout << "Data directory: " << std::filesystem::absolute(dataRoot) << "\n";
+        std::cout << "Data directory: " << fileService.dataRoot() << "\n";
         std::cout << "Static files: " << staticRoot << "\n";
+        app.loglevel(crow::LogLevel::Warning);
         app.port(port).multithreaded().run();
 
     } catch (const std::exception& error) {

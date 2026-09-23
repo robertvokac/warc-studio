@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.26)
 project(warc-studio
     VERSION 0.1.0
-    DESCRIPTION "Small C++23 archive studio for Browsertrix, WACZ files, and ReplayWeb.page"
+    DESCRIPTION "Personal web archive: built-in crawler writing timestamped WARC captures, tags and ReplayWeb.page replay"
     LANGUAGES CXX
 )
 
@@ -56,18 +56,28 @@ find_package(Threads REQUIRED)
 # OpenSSL — used for SHA-256 checksum computation on archive files
 find_package(OpenSSL REQUIRED)
 
+# zlib — gzip for WARC records, decoding compressed HTTP responses, reading .warc.gz uploads
+find_package(ZLIB REQUIRED)
+
+# libcurl — HTTP client of the built-in crawler (apt install libcurl4-openssl-dev)
+find_package(CURL REQUIRED)
+
 # ---------------------------------------------------------------------------
 # Application target
 # ---------------------------------------------------------------------------
 
 add_executable(warc-studio
     src/main.cpp
-    src/BrowsertrixService.cpp
-    src/CaptureDepthPolicy.cpp
+    src/CrawlScope.cpp
+    src/CaptureUtil.cpp
+    src/Crawler.cpp
+    src/CrawlService.cpp
     src/Database.cpp
     src/FileService.cpp
     src/Html.cpp
+    src/HtmlLinks.cpp
     src/HttpUtil.cpp
+    src/WarcWriter.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -75,20 +85,28 @@ add_executable(warc-studio
 # ---------------------------------------------------------------------------
 
 add_executable(warc-studio-tests
-    src/CaptureDepthPolicy.cpp
-    tests/test_capture_depth_policy.cpp
+    src/CaptureUtil.cpp
+    src/CrawlScope.cpp
+    tests/test_crawl_scope.cpp
 )
 
-target_include_directories(warc-studio-tests
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+add_executable(warc-studio-util-tests
+    src/CaptureUtil.cpp
+    src/HtmlLinks.cpp
+    tests/test_capture_util.cpp
 )
 
-if(MSVC)
-    target_compile_options(warc-studio-tests PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(warc-studio-tests PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+foreach(test_target warc-studio-tests warc-studio-util-tests)
+    target_include_directories(${test_target}
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    if(MSVC)
+        target_compile_options(${test_target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${test_target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endforeach()
 
 target_include_directories(warc-studio
     PRIVATE
@@ -109,6 +127,8 @@ target_link_libraries(warc-studio
         SQLite::SQLite3
         Threads::Threads
         OpenSSL::Crypto
+        ZLIB::ZLIB
+        CURL::libcurl
 )
 
 if(MSVC)
@@ -118,12 +138,15 @@ else()
 endif()
 
 # Copy the static/ directory to the build output so the app can serve CSS and favicon.
-add_custom_command(TARGET warc-studio POST_BUILD
+# A separate target runs on every build, so CSS/JS edits are picked up even when
+# the executable does not need to be relinked.
+add_custom_target(warc-studio-static ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/static"
         "${CMAKE_CURRENT_BINARY_DIR}/static"
     COMMENT "Copying static assets to build directory"
 )
+add_dependencies(warc-studio warc-studio-static)
 
 install(TARGETS warc-studio RUNTIME DESTINATION bin)
 install(DIRECTORY static/ DESTINATION share/warc-studio/static)

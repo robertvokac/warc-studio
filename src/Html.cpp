@@ -1,41 +1,177 @@
 #include "warc_studio/Html.hpp"
+#include "warc_studio/CaptureUtil.hpp"
 #include "warc_studio/HttpUtil.hpp"
 
-#include <map>
+#include <algorithm>
+#include <format>
 #include <sstream>
 
 namespace warc_studio {
+namespace {
 
 // ---------------------------------------------------------------------------
-// HTML helpers
+// Small helpers
 // ---------------------------------------------------------------------------
 
 std::string statusBadge(const std::string& status) {
-    return "<span class=\"badge badge-" + htmlEscape(status) + "\">"
-         + htmlEscape(status) + "</span>";
+    return "<span class=\"badge badge-" + htmlEscape(status) + "\">" + htmlEscape(status) + "</span>";
 }
 
-namespace {
-
-std::string displayTitle(const Entry& entry) {
-    if (entry.title && !entry.title->empty()) {
-        return *entry.title;
-    }
-    return entry.url;
-}
-
-// Returns the human-readable file size string.
 std::string formatBytes(std::int64_t bytes) {
     if (bytes < 1024) return std::to_string(bytes) + " B";
-    if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
-    return std::to_string(bytes / (1024 * 1024)) + " MB";
+    if (bytes < 1024 * 1024) return std::format("{:.1f} KB", static_cast<double>(bytes) / 1024);
+    if (bytes < 1024LL * 1024 * 1024) return std::format("{:.1f} MB", static_cast<double>(bytes) / (1024 * 1024));
+    return std::format("{:.2f} GB", static_cast<double>(bytes) / (1024.0 * 1024 * 1024));
+}
+
+std::string displayTitle(const Capture& capture) {
+    return capture.title && !capture.title->empty() ? *capture.title : capture.url;
+}
+
+// Rendered in UTC; the footer script converts it to the browser's local time.
+std::string timeTag(const std::string& timestamp) {
+    return "<time data-ts=\"" + htmlEscape(timestamp) + "\">" + htmlEscape(formatTimestamp(timestamp))
+         + " UTC</time>";
+}
+
+std::string urlHistoryHref(const std::string& url) {
+    return "/url?url=" + urlEncode(url);
+}
+
+std::string tagChips(const std::vector<std::string>& tags) {
+    std::string html;
+    for (const auto& tag : tags) {
+        html += "<a class=\"tag\" href=\"/captures?tag=" + urlEncode(tag) + "\">" + htmlEscape(tag) + "</a>";
+    }
+    return html;
+}
+
+// Text input for a comma separated tag list, with clickable suggestions of the most used tags.
+std::string tagInput(const std::string& id, const std::string& value, const std::vector<TagCount>& allTags) {
+    std::ostringstream html;
+    html << "<input type=\"text\" id=\"" << id << "\" name=\"tags\" value=\"" << htmlEscape(value)
+         << "\" placeholder=\"tags, comma separated\" autocomplete=\"off\">\n";
+    if (!allTags.empty()) {
+        auto top = allTags;
+        std::sort(top.begin(), top.end(), [](const TagCount& a, const TagCount& b) {
+            return a.count != b.count ? a.count > b.count : a.name < b.name;
+        });
+        if (top.size() > 30) top.resize(30);
+        std::sort(top.begin(), top.end(), [](const TagCount& a, const TagCount& b) { return a.name < b.name; });
+        html << "<div class=\"tag-suggestions\">";
+        for (const auto& tag : top) {
+            html << "<button type=\"button\" class=\"tag tag-suggest\" data-target=\"" << id
+                 << "\" data-add-tag=\"" << htmlEscape(tag.name) << "\">+ " << htmlEscape(tag.name) << "</button>";
+        }
+        html << "</div>\n";
+    }
+    return html.str();
+}
+
+// Depth (link hops from the start page), scope and page limit; scope and limit only matter for depth != 0.
+std::string depthFields(const std::string& idPrefix, int depth = 0, CrawlScope scope = CrawlScope::PREFIX,
+                        int pageLimit = 50) {
+    std::ostringstream html;
+    html << "<div class=\"form-group\"><label for=\"" << idPrefix << "-depth\">Depth</label>"
+         << "<select id=\"" << idPrefix << "-depth\" name=\"max_depth\" data-depth=\"" << idPrefix << "-links\""
+         << " title=\"How many clicks away from the page links are followed\">";
+    html << "<option value=\"0\"" << (depth == 0 ? " selected" : "") << ">Page only</option>";
+    for (int d = 1; d <= kMaxCrawlDepth; ++d) {
+        html << "<option value=\"" << d << "\"" << (depth == d ? " selected" : "") << ">" << d
+             << (d == 1 ? " click" : " clicks") << " deep</option>";
+    }
+    html << "<option value=\"" << kUnlimitedDepth << "\"" << (depth == kUnlimitedDepth ? " selected" : "")
+         << ">All linked pages</option></select></div>\n";
+
+    html << "<div class=\"form-row nested\" id=\"" << idPrefix << "-links\">"
+         << "<div class=\"form-group\"><label>Follow links to</label><select name=\"crawl_scope\">";
+    const std::pair<CrawlScope, const char*> scopes[] = {
+        {CrawlScope::PREFIX, "Same path (under the page's directory)"},
+        {CrawlScope::DOMAIN, "Whole domain incl. subdomains"},
+        {CrawlScope::ANY, "Any site (needs a limited depth)"},
+    };
+    for (const auto& [value, label] : scopes) {
+        html << "<option value=\"" << crawlScopeToString(value) << "\"" << (scope == value ? " selected" : "")
+             << ">" << label << "</option>";
+    }
+    html << "</select></div>"
+         << "<div class=\"form-group\"><label>Max pages</label>"
+         << "<input type=\"number\" name=\"page_limit\" value=\"" << pageLimit << "\" min=\"0\" style=\"width:7em\" "
+         << "title=\"0 = no limit (at most 10000)\"></div></div>\n";
+    return html.str();
+}
+
+// Replay / download buttons for an archived capture.
+std::string captureButtons(const Capture& capture, bool small = true) {
+    if (capture.status != "archived" || !capture.filePath) {
+        return {};
+    }
+    std::ostringstream html;
+    const std::string size = small ? " btn-sm" : "";
+    html << "<a class=\"btn" << size << "\" href=\"/capture/" << capture.id << "/replay\" target=\"_blank\">Replay</a>"
+         << "<a class=\"btn" << size << " btn-secondary\" href=\"/capture/" << capture.id << "/download\" title=\"Download "
+         << htmlEscape(captureDownloadName(capture)) << "\">&#11015; " << htmlEscape(capture.fileType.value_or("")) << "</a>";
+    return html.str();
+}
+
+std::string sizeCell(const Capture& capture) {
+    return capture.sizeBytes ? formatBytes(*capture.sizeBytes) : "—";
+}
+
+// Table of captures; with groupByDay a header row is inserted for each new (UTC) day.
+void renderCaptureTable(std::ostringstream& html, const std::vector<Capture>& captures, bool groupByDay,
+                        bool showUrl = true) {
+    if (captures.empty()) {
+        html << "<p class=\"muted\">No captures found.</p>\n";
+        return;
+    }
+    html << "<div class=\"table-wrap\"><table class=\"captures\">\n<thead><tr>"
+         << "<th>Captured</th>" << (showUrl ? "<th>Page</th>" : "") << "<th>Tags</th><th>Status</th>"
+         << "<th class=\"num\">Size</th><th></th></tr></thead>\n<tbody>\n";
+    std::string day;
+    const int columns = showUrl ? 6 : 5;
+    for (const auto& capture : captures) {
+        if (groupByDay && capture.timestamp.substr(0, 8) != day) {
+            day = capture.timestamp.substr(0, 8);
+            html << "<tr class=\"day-row\"><td colspan=\"" << columns << "\">"
+                 << htmlEscape(formatTimestamp(capture.timestamp).substr(0, 10)) << "</td></tr>\n";
+        }
+        html << "<tr>\n";
+        html << "  <td class=\"nowrap\"><a href=\"/capture/" << capture.id << "\">" << timeTag(capture.timestamp)
+             << "</a><div class=\"muted mono small\">" << htmlEscape(capture.timestamp) << "</div></td>\n";
+        if (showUrl) {
+            html << "  <td class=\"page-cell\"><a href=\"/capture/" << capture.id << "\"><strong>"
+                 << htmlEscape(displayTitle(capture)) << "</strong></a>"
+                 << "<div class=\"mono small\"><a class=\"muted\" href=\"" << htmlEscape(urlHistoryHref(capture.url))
+                 << "\" title=\"All captures of this URL\">" << htmlEscape(capture.url) << "</a></div></td>\n";
+        }
+        html << "  <td>" << tagChips(capture.tags) << "</td>\n";
+        html << "  <td>" << statusBadge(capture.status);
+        if (capture.source == "upload") html << " <span class=\"muted small\">upload</span>";
+        if (capture.maxDepth != 0) {
+            html << " <span class=\"muted small\" title=\"" << htmlEscape(crawlDepthLabel(capture)) << "\">"
+                 << (capture.maxDepth == kUnlimitedDepth ? "+all" : "+" + std::to_string(capture.maxDepth)) << "</span>";
+        }
+        html << "</td>\n";
+        html << "  <td class=\"num nowrap\">" << sizeCell(capture) << "</td>\n";
+        html << "  <td class=\"td-actions\">" << captureButtons(capture) << "</td>\n";
+        html << "</tr>\n";
+    }
+    html << "</tbody>\n</table></div>\n";
+}
+
+bool hasActiveCaptures(const std::vector<Capture>& captures) {
+    return std::any_of(captures.begin(), captures.end(), [](const Capture& c) {
+        return c.status == "queued" || c.status == "crawling";
+    });
 }
 
 // ---------------------------------------------------------------------------
-// Shared page shell — uses external CSS + favicon
+// Page shell
 // ---------------------------------------------------------------------------
 
-std::string pageHeader(const std::string& title, const std::string& activeNav) {
+std::string pageHeader(const std::string& title, const std::string& activeNav, const std::string& extraHead = {},
+                       const std::string& searchValue = {}) {
     std::ostringstream html;
     html << R"HTML(<!doctype html>
 <html lang="en">
@@ -45,870 +181,587 @@ std::string pageHeader(const std::string& title, const std::string& activeNav) {
   <title>)HTML" << htmlEscape(title) << R"HTML( — warc-studio</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
-</head>
+)HTML" << extraHead << R"HTML(</head>
 <body>
 <header class="site-header">
   <a class="logo" href="/">&#127760; warc-studio</a>
   <nav class="site-nav">
-    <a href="/collections")HTML";
-    if (activeNav == "collections") html << " class=\"active\"";
-    html << R"HTML(>Collections</a>
-    <a href="/entries")HTML";
-    if (activeNav == "entries") html << " class=\"active\"";
-    html << R"HTML(>Entries</a>
-    <a href="/archives-browser")HTML";
-    if (activeNav == "archives") html << " class=\"active\"";
-    html << R"HTML(>Archive Files</a>
-    <a href="/about")HTML";
-    if (activeNav == "about") html << " class=\"active\"";
-    html << R"HTML(>About</a>
-  </nav>
-</header>
-<div class="container">
 )HTML";
+    const std::pair<const char*, const char*> links[] = {
+        {"/", "Save"}, {"/captures", "Browse"}, {"/tags", "Tags"}, {"/upload", "Upload"}, {"/about", "About"},
+    };
+    for (const auto& [href, label] : links) {
+        html << "    <a href=\"" << href << "\"" << (activeNav == href ? " class=\"active\"" : "") << ">"
+             << label << "</a>\n";
+    }
+    html << "  </nav>\n"
+         << "  <form class=\"header-search\" method=\"get\" action=\"/captures\">"
+         << "<input type=\"search\" name=\"q\" value=\"" << htmlEscape(searchValue)
+         << "\" placeholder=\"Search URL or title…\"></form>\n"
+         << "</header>\n<div class=\"container\">\n";
     return html.str();
 }
 
 std::string pageFooter() {
-    return "</div>\n</body>\n</html>\n";
+    return R"HTML(</div>
+<script>
+// Show Wayback timestamps (UTC) in the browser's local time.
+document.querySelectorAll('time[data-ts]').forEach(function (el) {
+  var s = el.dataset.ts;
+  if (!/^\d{14}$/.test(s)) return;
+  var d = new Date(Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8),
+                            +s.slice(8, 10), +s.slice(10, 12), +s.slice(12, 14)));
+  el.title = el.textContent;
+  el.textContent = d.toLocaleString();
+});
+// Tag suggestion chips append their tag to the tag input.
+document.addEventListener('click', function (e) {
+  var b = e.target.closest('[data-add-tag]');
+  if (!b) return;
+  e.preventDefault();
+  var input = document.getElementById(b.dataset.target);
+  var tags = input.value.split(',').map(function (t) { return t.trim(); }).filter(Boolean);
+  if (tags.indexOf(b.dataset.addTag) === -1) tags.push(b.dataset.addTag);
+  input.value = tags.join(', ');
+  input.focus();
+});
+// Scope and page limit only apply when links are followed (depth other than "Page only").
+document.querySelectorAll('select[data-depth]').forEach(function (sel) {
+  var field = document.getElementById(sel.dataset.depth);
+  var update = function () { field.hidden = sel.value === '0'; };
+  sel.addEventListener('change', update);
+  update();
+});
+</script>
+</body>
+</html>
+)HTML";
 }
 
 void renderMessage(std::ostringstream& html, const std::optional<std::string>& message) {
     if (message && !message->empty()) {
-        html << "<div class=\"message\">" << htmlEscape(*message) << "</div>\n";
+        const bool error = message->rfind("Error", 0) == 0;
+        html << "<div class=\"message" << (error ? " error" : "") << "\">" << htmlEscape(*message) << "</div>\n";
     }
 }
 
-// Renders a collection selector dropdown form.
-void renderCollectionSwitcher(std::ostringstream& html,
-                               const std::vector<Collection>& allCollections,
-                               int currentId,
-                               const std::string& action) {
-    html << "<form method=\"get\" action=\"" << htmlEscape(action) << "\" style=\"display:inline-block;\">\n";
-    html << "  <select name=\"collection_id\" onchange=\"this.form.submit()\">\n";
-    for (const auto& c : allCollections) {
-        html << "    <option value=\"" << c.id << "\"";
-        if (c.id == currentId) html << " selected";
-        html << ">" << htmlEscape(c.name) << "</option>\n";
-    }
-    html << "  </select>\n";
-    html << "</form>\n";
-}
-
-// Renders the archive files list for one entry (used in entry detail page).
-void renderArchiveFilesList(std::ostringstream& html,
-                             const std::vector<ArchiveFile>& files,
-                             [[maybe_unused]] int entryId) {
-    if (files.empty()) {
-        html << "<p class=\"muted\">No archive files yet.</p>\n";
-        return;
-    }
-    for (const auto& af : files) {
-        const auto slash = af.path.rfind('/');
-        const std::string fname = slash == std::string::npos ? af.path : af.path.substr(slash + 1);
-        const bool isWacz = af.fileType == "wacz";
-
-        html << "<div class=\"archive-file-row\">\n";
-        html << "  <span class=\"badge badge-" << htmlEscape(af.fileType) << "\" style=\"background:#444\">"
-             << htmlEscape(af.fileType) << "</span>\n";
-        html << "  <span class=\"archive-file-name\" title=\"" << htmlEscape(af.path) << "\">"
-             << htmlEscape(fname) << "</span>\n";
-        if (af.source && !af.source->empty()) {
-            html << "  <span class=\"archive-file-meta\">source: " << htmlEscape(*af.source) << "</span>\n";
-        }
-        if (af.sizeBytes) {
-            html << "  <span class=\"archive-file-meta\">" << formatBytes(*af.sizeBytes) << "</span>\n";
-        }
-        if (af.sha256 && !af.sha256->empty()) {
-            html << "  <span class=\"archive-file-meta muted mono\">sha256: " << htmlEscape(af.sha256->substr(0, 16)) << "…</span>\n";
-        }
-        html << "  <span class=\"archive-file-meta muted\">" << htmlEscape(af.createdAt) << "</span>\n";
-        // Show serve URL for debugging (always visible so user can test the link directly).
-        {
-            const std::string archiveHref = "/archives/"
-                + (af.path.rfind("archives/", 0) == 0 ? af.path.substr(9) : af.path);
-            html << "  <br><span class=\"muted\" style=\"font-size:0.75rem\">URL: </span>"
-                 << "<a class=\"muted mono\" style=\"font-size:0.75rem\" href=\""
-                 << htmlEscape(archiveHref) << "\" target=\"_blank\">"
-                 << htmlEscape(archiveHref) << "</a>"
-                 << "  <a class=\"muted\" style=\"font-size:0.75rem\" href=\""
-                 << htmlEscape(archiveHref) << "\" download>&#11015;</a>\n";
-        }
-        if (isWacz) {
-            html << "  <form method=\"get\" action=\"/archive/" << af.id << "/replay\" target=\"_blank\">"
-                 << "<button class=\"btn-sm\" type=\"submit\">Replay</button></form>\n";
-            html << "  <a href=\"/archive/" << af.id
-                 << "/replay/local\" target=\"_blank\"><button class=\"btn-sm btn-secondary\" type=\"button\">Debug replay</button></a>\n";
-        } else {
-            html << "  <span class=\"muted\">WARC replay not supported yet</span>\n";
-        }
-        // Edit label inline form
-        html << "  <details style=\"display:inline-block;margin-left:0.5em;\">\n";
-        html << "    <summary class=\"btn-sm btn-secondary\" style=\"cursor:pointer;display:inline;\">";
-        if (af.label && !af.label->empty()) {
-            html << htmlEscape(*af.label);
-        } else {
-            html << "Edit label";
-        }
-        html << "</summary>\n";
-        html << "    <form method=\"post\" action=\"/archive/" << af.id << "/update\" style=\"display:inline-flex;gap:0.3em;align-items:center;\">\n";
-        html << "      <input type=\"text\" name=\"label\" value=\"" << htmlEscape(af.label.value_or("")) << "\" placeholder=\"Label\" size=\"20\">\n";
-        html << "      <button class=\"btn-sm\" type=\"submit\">Save</button>\n";
-        html << "    </form>\n";
-        html << "  </details>\n";
-        // Delete archive file button
-        html << "  <form method=\"post\" action=\"/archive/" << af.id
-             << "/delete\" style=\"display:inline;\" onsubmit=\"return confirm('Delete this archive file?');\">";
-        html << "<button class=\"btn-sm btn-danger\" type=\"submit\">Delete</button></form>\n";
-        html << "</div>\n";
-    }
-}
-
-// Renders the entries table shared by collections detail and entries pages.
-void renderEntriesTable(std::ostringstream& html,
-                         const std::vector<Entry>& entries,
-                         bool showCollection = false) {
-    html << "<table>\n<thead><tr>\n";
-    html << "  <th>#</th>\n";
-    if (showCollection) html << "  <th>Collection</th>\n";
-    html << "  <th>Title / URL</th>\n";
-    html << "  <th>Status</th>\n";
-    html << "  <th>Depth</th>\n";
-    html << "  <th>Archives</th>\n";
-    html << "  <th>Created</th>\n";
-    html << "  <th>Actions</th>\n";
-    html << "</tr></thead>\n<tbody>\n";
-
-    if (entries.empty()) {
-        const int cols = showCollection ? 8 : 7;
-        html << "<tr><td colspan=\"" << cols << "\" class=\"muted\">No entries yet.</td></tr>\n";
-    }
-
-    for (const auto& entry : entries) {
-        html << "<tr>\n";
-        // Entry number
-        html << "  <td><span class=\"num-badge\">#" << entry.numberPerCollection << "</span></td>\n";
-        if (showCollection) {
-            html << "  <td class=\"muted\">" << htmlEscape(entry.collectionName) << "</td>\n";
-        }
-        // Title / URL
-        html << "  <td><a href=\"/entry/" << entry.id << "\">"
-             << "<strong>" << htmlEscape(displayTitle(entry)) << "</strong></a>"
-             << "<br><span class=\"muted mono\">" << htmlEscape(entry.url) << "</span>";
-        if (entry.lastError && !entry.lastError->empty()) {
-            html << "<div class=\"error-text\">" << htmlEscape(*entry.lastError) << "</div>";
-        }
-        html << "</td>\n";
-        // Status
-        html << "  <td>" << statusBadge(entry.status) << "</td>\n";
-        // Capture depth
-        html << "  <td class=\"muted\">" << htmlEscape(captureDepthLabel(entry.captureDepth)) << "</td>\n";
-        // Archive count
-        html << "  <td class=\"muted\">" << entry.archiveFileCount << "</td>\n";
-        // Created
-        html << "  <td class=\"muted\">" << htmlEscape(entry.createdAt.substr(0, 10)) << "</td>\n";
-        // Actions
-        html << "  <td class=\"td-actions\">\n";
-        html << "    <form method=\"post\" action=\"/entry/" << entry.id << "/start\">"
-             << "<button class=\"btn-sm btn-secondary\" type=\"submit\">Start rec</button></form>\n";
-        html << "    <form method=\"post\" action=\"/entry/" << entry.id << "/stop\">"
-             << "<button class=\"btn-sm btn-secondary\" type=\"submit\">Stop rec</button></form>\n";
-        html << "    <a href=\"/entry/" << entry.id << "\"><button class=\"btn-sm btn-secondary\" type=\"button\">Detail</button></a>\n";
-        if (entry.archiveFileCount > 0) {
-            html << "    <form method=\"get\" action=\"/entry/" << entry.id << "/replay/latest\" target=\"_blank\">"
-                 << "<button class=\"btn-sm\" type=\"submit\">Replay</button></form>\n";
-        }
-        html << "    <form method=\"post\" action=\"/entry/" << entry.id
-             << "/delete\" onsubmit=\"return confirm('Delete entry #"
-             << entry.numberPerCollection << " and its archive files?')\">"
-             << "<button class=\"btn-sm btn-danger\" type=\"submit\">Delete</button></form>\n";
-        html << "  </td>\n";
-        html << "</tr>\n";
-    }
-
-    html << "</tbody>\n</table>\n";
+std::string autoRefresh(int seconds) {
+    return "  <meta http-equiv=\"refresh\" content=\"" + std::to_string(seconds) + "\">\n";
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Collections page
+// Home: Save Page Now
 // ---------------------------------------------------------------------------
 
-std::string renderCollectionsPage(
-    const std::vector<Collection>& collections,
-    const std::optional<std::string>& message,
-    const std::string& activeNav
-) {
+std::string renderHomePage(const HomeView& view) {
     std::ostringstream html;
-    html << pageHeader("Collections", activeNav);
+    // Refresh while something is crawling, but never while the user may be typing a new URL.
+    const bool refresh = view.url.empty() && hasActiveCaptures(view.recentCaptures);
+    html << pageHeader("Save Page Now", "/", refresh ? autoRefresh(10) : "");
+    renderMessage(html, view.message);
+
+    html << "<div class=\"card hero\">\n<h1>Save Page Now</h1>\n"
+         << "<p class=\"muted\">Paste a URL to check whether it is already archived, then archive it. "
+         << "Every save creates a new timestamped capture with its own WARC file.</p>\n";
+    html << "<form method=\"post\" action=\"/save\" class=\"save-form\">\n";
+    html << "<div class=\"save-url\"><input type=\"text\" id=\"url\" name=\"url\" required autofocus "
+         << "placeholder=\"https://example.com/page\" value=\"" << htmlEscape(view.url) << "\">"
+         << "<button type=\"submit\">Save page</button></div>\n";
+    html << "<div id=\"lookup\" class=\"lookup\" aria-live=\"polite\"></div>\n";
+    html << "<div class=\"form-row\">\n";
+    html << "<div class=\"form-group grow\"><label for=\"save-tags\">Tags</label>"
+         << tagInput("save-tags", view.tags, view.allTags) << "</div>\n";
+    html << "</div>\n<div class=\"form-row\">\n";
+    html << "<div class=\"form-group grow\"><label>Title (optional, detected automatically)</label>"
+         << "<input type=\"text\" name=\"title\" value=\"" << htmlEscape(view.title) << "\"></div>\n";
+    html << depthFields("save");
+    html << "</div>\n</form>\n";
+    html << "<p class=\"muted small\"><a href=\"/save/bulk\">Save many URLs at once</a> · "
+         << "<a href=\"/upload\">Upload your own WARC/WACZ</a> · "
+         << "<a href=\"/about#bookmarklet\">Bookmarklet</a> for saving the page you are looking at.</p>\n";
+    html << "</div>\n";
+
+    if (!view.url.empty()) {
+        html << "<div class=\"card\">\n<h2>Existing captures of this URL (" << view.existingCaptures.size()
+             << ")</h2>\n";
+        renderCaptureTable(html, view.existingCaptures, false, false);
+        html << "</div>\n";
+    }
+
+    const auto& s = view.stats;
+    html << "<div class=\"stats\">"
+         << "<span><strong>" << s.captures << "</strong> captures</span>"
+         << "<span><strong>" << s.urls << "</strong> URLs</span>"
+         << "<span><strong>" << formatBytes(s.totalBytes) << "</strong> on disk</span>";
+    if (s.queued + s.crawling > 0) {
+        html << "<span><a href=\"/captures?status=crawling\">" << s.crawling << " crawling</a>, "
+             << "<a href=\"/captures?status=queued\">" << s.queued << " queued</a></span>";
+    }
+    if (s.failed > 0) {
+        html << "<span><a href=\"/captures?status=failed\">" << s.failed << " failed</a></span>";
+    }
+    html << "</div>\n";
+
+    html << "<div class=\"card\">\n<div class=\"card-head\"><h2>Recent captures</h2>"
+         << "<a href=\"/captures\">Browse all &rarr;</a></div>\n";
+    renderCaptureTable(html, view.recentCaptures, true);
+    html << "</div>\n";
+
+    // Live "is it already archived?" check while typing.
+    html << R"HTML(<script>
+(function () {
+  var input = document.getElementById('url');
+  var box = document.getElementById('lookup');
+  var timer, seq = 0;
+  function check() {
+    var value = input.value.trim();
+    var mine = ++seq;
+    box.textContent = '';
+    box.className = 'lookup';
+    if (!value) return;
+    fetch('/api/lookup?url=' + encodeURIComponent(value))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (mine !== seq) return;
+        if (j.count === 0) {
+          box.className = 'lookup lookup-new';
+          box.textContent = 'Not archived yet.';
+          return;
+        }
+        box.className = 'lookup lookup-found';
+        box.append('Already archived ' + j.count + '×' + (j.archived < j.count ? ' (' + j.archived + ' successful)' : '') + ', last capture ');
+        var last = document.createElement('a');
+        last.href = '/capture/' + j.last.id;
+        last.textContent = new Date(j.last.iso).toLocaleString() + ' (' + j.last.status + ')';
+        box.append(last, ' · ');
+        var all = document.createElement('a');
+        all.href = '/url?url=' + encodeURIComponent(value);
+        all.textContent = 'show all captures';
+        box.append(all);
+        if (j.last.tags.length) box.append(' · tags: ' + j.last.tags.join(', '));
+      })
+      .catch(function () {});
+  }
+  input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(check, 250); });
+  check();
+})();
+</script>
+)HTML";
+
+    html << pageFooter();
+    return html.str();
+}
+
+std::string renderBulkSavePage(const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
+    std::ostringstream html;
+    html << pageHeader("Save many URLs", "/");
+    renderMessage(html, message);
+    html << "<div class=\"card\">\n<h1>Save many URLs</h1>\n"
+         << "<p class=\"muted\">One URL per line. Each URL becomes its own capture in the crawl queue.</p>\n";
+    html << "<form method=\"post\" action=\"/save/bulk\">\n";
+    html << "<textarea name=\"urls\" rows=\"12\" required placeholder=\"https://example.com/a&#10;https://example.org/b\"></textarea>\n";
+    html << "<div class=\"form-row mt-1\">\n<div class=\"form-group grow\"><label>Tags for all URLs</label>"
+         << tagInput("bulk-tags", "", allTags) << "</div>\n";
+    html << depthFields("bulk");
+    html << "</div>\n";
+    html << "<label class=\"checkbox\"><input type=\"checkbox\" name=\"skip_archived\" value=\"1\" checked> "
+         << "Skip URLs that are already archived</label>\n";
+    html << "<div class=\"mt-1\"><button type=\"submit\">Queue all</button></div>\n";
+    html << "</form>\n</div>\n";
+    html << pageFooter();
+    return html.str();
+}
+
+// ---------------------------------------------------------------------------
+// Browse / search
+// ---------------------------------------------------------------------------
+
+std::string renderBrowsePage(const BrowseView& view) {
+    std::ostringstream html;
+    const auto& q = view.query;
+    html << pageHeader("Browse captures", "/captures",
+                       hasActiveCaptures(view.captures) ? autoRefresh(10) : "", q.urlContains);
+    renderMessage(html, view.message);
+
+    html << "<div class=\"page-title\"><h1>Captures</h1></div>\n";
+    html << "<div class=\"card\">\n<form method=\"get\" action=\"/captures\" class=\"filter-form\">\n"
+         << "<div class=\"form-row\">\n"
+         << "<div class=\"form-group grow\"><label>URL or title contains</label>"
+         << "<input type=\"text\" name=\"q\" value=\"" << htmlEscape(q.urlContains)
+         << "\" placeholder=\"example.com/blog\"></div>\n"
+         << "<div class=\"form-group\"><label>Tags (all must match)</label>"
+         << "<input type=\"text\" name=\"tag\" value=\"" << htmlEscape(view.tagText) << "\" list=\"tag-list\"></div>\n"
+         << "<div class=\"form-group\"><label>Status</label><select name=\"status\">";
+    for (const char* status : {"", "archived", "queued", "crawling", "failed", "cancelled"}) {
+        html << "<option value=\"" << status << "\"" << (q.status == status ? " selected" : "") << ">"
+             << (*status ? status : "any") << "</option>";
+    }
+    html << "</select></div>\n"
+         << "<div class=\"form-group\"><label>Order</label><select name=\"order\">"
+         << "<option value=\"newest\">newest first</option>"
+         << "<option value=\"oldest\"" << (q.oldestFirst ? " selected" : "") << ">oldest first</option>"
+         << "</select></div>\n"
+         << "<button type=\"submit\">Search</button>\n"
+         << "<a class=\"btn btn-secondary\" href=\"/captures\">Reset</a>\n"
+         << "</div>\n</form>\n";
+    html << "<datalist id=\"tag-list\">";
+    for (const auto& tag : view.allTags) {
+        html << "<option value=\"" << htmlEscape(tag.name) << "\">";
+    }
+    html << "</datalist>\n</div>\n";
+
+    const int pages = std::max(1, (view.total + view.pageSize - 1) / view.pageSize);
+    html << "<div class=\"card\">\n<div class=\"card-head\"><h2>" << view.total << " captures</h2>";
+    if (!q.urlContains.empty() && view.total > 0) {
+        html << "<a href=\"" << htmlEscape(urlHistoryHref(normalizeInputUrl(q.urlContains)))
+             << "\">Exact URL history &rarr;</a>";
+    }
+    html << "</div>\n";
+    renderCaptureTable(html, view.captures, true);
+
+    if (pages > 1) {
+        auto pageLink = [&](int page) {
+            std::string href = "/captures?page=" + std::to_string(page);
+            if (!q.urlContains.empty()) href += "&q=" + urlEncode(q.urlContains);
+            if (!view.tagText.empty()) href += "&tag=" + urlEncode(view.tagText);
+            if (!q.status.empty()) href += "&status=" + urlEncode(q.status);
+            if (q.oldestFirst) href += "&order=oldest";
+            return href;
+        };
+        html << "<div class=\"pagination\">";
+        if (view.page > 1) html << "<a href=\"" << htmlEscape(pageLink(view.page - 1)) << "\">&larr; Newer</a>";
+        html << "<span>Page " << view.page << " / " << pages << "</span>";
+        if (view.page < pages) html << "<a href=\"" << htmlEscape(pageLink(view.page + 1)) << "\">Older &rarr;</a>";
+        html << "</div>\n";
+    }
+    html << "</div>\n";
+    html << pageFooter();
+    return html.str();
+}
+
+// ---------------------------------------------------------------------------
+// URL history
+// ---------------------------------------------------------------------------
+
+std::string renderUrlPage(const std::string& url, const std::vector<Capture>& captures,
+                          const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
+    std::ostringstream html;
+    html << pageHeader("History of " + url, "/captures", hasActiveCaptures(captures) ? autoRefresh(10) : "");
     renderMessage(html, message);
 
-    html << "<div class=\"page-title\"><h1>Collections</h1></div>\n";
+    html << "<div class=\"page-title\"><h1 class=\"break\">" << htmlEscape(url) << "</h1>\n"
+         << "<p class=\"muted\">Saved " << captures.size() << " time" << (captures.size() == 1 ? "" : "s");
+    if (!captures.empty()) {
+        html << " between " << timeTag(captures.back().timestamp) << " and " << timeTag(captures.front().timestamp);
+    }
+    html << " · <a href=\"" << htmlEscape(url) << "\" target=\"_blank\" rel=\"noreferrer\">open live page</a></p></div>\n";
 
-    // List of existing collections
+    // Years overview, like the Wayback Machine's year bar.
+    if (captures.size() > 1) {
+        std::vector<std::pair<std::string, int>> years;
+        for (const auto& c : captures) {
+            const auto year = c.timestamp.substr(0, 4);
+            if (years.empty() || years.back().first != year) years.emplace_back(year, 0);
+            ++years.back().second;
+        }
+        html << "<div class=\"years\">";
+        for (const auto& [year, count] : years) {
+            html << "<span class=\"year\"><strong>" << year << "</strong> " << count << "</span>";
+        }
+        html << "</div>\n";
+    }
+
     html << "<div class=\"card\">\n";
-    html << "<table>\n<thead><tr>\n";
-    html << "  <th>Name</th><th>Description</th><th>Created</th><th>Actions</th>\n";
-    html << "</tr></thead>\n<tbody>\n";
+    renderCaptureTable(html, captures, true, false);
+    html << "</div>\n";
 
-    if (collections.empty()) {
-        html << "<tr><td colspan=\"4\" class=\"muted\">No collections yet.</td></tr>\n";
-    }
-    for (const auto& col : collections) {
-        html << "<tr>\n";
-        html << "  <td><a href=\"/collections/" << col.id << "/entries\">"
-             << htmlEscape(col.name) << "</a></td>\n";
-        html << "  <td class=\"muted\">" << htmlEscape(col.description.value_or("")) << "</td>\n";
-        html << "  <td class=\"muted\">" << htmlEscape(col.createdAt.substr(0, 10)) << "</td>\n";
-        html << "  <td class=\"td-actions\">\n";
-        html << "    <a href=\"/collections/" << col.id << "/entries\">"
-             << "<button class=\"btn-sm\" type=\"button\">Open entries</button></a>\n";
-        html << "    <a href=\"/collection/" << col.id << "\">"
-             << "<button class=\"btn-sm btn-secondary\" type=\"button\">Edit</button></a>\n";
-        html << "    <form method=\"post\" action=\"/collection/" << col.id
-             << "/delete\" onsubmit=\"return confirm('Delete collection &quot;" << htmlEscape(col.name)
-             << "&quot; and ALL its entries?')\">"
-             << "<button class=\"btn-sm btn-danger\" type=\"submit\">Delete</button></form>\n";
-        html << "  </td>\n";
-        html << "</tr>\n";
-    }
-
-    html << "</tbody>\n</table>\n</div>\n";
-
-    // Create new collection form
-    html << "<div class=\"card\">\n<h2>New collection</h2>\n";
-    html << "<form method=\"post\" action=\"/collection/new\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "  <input type=\"text\" name=\"name\" required placeholder=\"Collection name\">\n";
-    html << "  <input type=\"text\" name=\"description\" placeholder=\"Optional description\" size=\"40\">\n";
-    html << "  <button type=\"submit\">Create collection</button>\n";
-    html << "</div>\n</form>\n</div>\n";
+    std::vector<std::string> lastTags;
+    if (!captures.empty()) lastTags = captures.front().tags;
+    html << "<div class=\"card\">\n<h2>Save this URL again</h2>\n"
+         << "<form method=\"post\" action=\"/save\">\n<input type=\"hidden\" name=\"url\" value=\""
+         << htmlEscape(url) << "\">\n<div class=\"form-row\">\n"
+         << "<div class=\"form-group grow\"><label>Tags</label>" << tagInput("again-tags", joinTags(lastTags), allTags)
+         << "</div>\n"
+         << (captures.empty() ? depthFields("again")
+                              : depthFields("again", captures.front().maxDepth, captures.front().scope,
+                                            captures.front().pageLimit.value_or(50)))
+         << "<button type=\"submit\">Save page</button>\n</div>\n</form>\n</div>\n";
 
     html << pageFooter();
     return html.str();
 }
 
 // ---------------------------------------------------------------------------
-// Entries page
+// Capture detail
 // ---------------------------------------------------------------------------
 
-std::string renderEntriesPage(
-    const std::optional<Collection>& currentCollection,
-    const std::vector<Collection>& allCollections,
-    const std::vector<Entry>& entries,
-    const std::optional<std::string>& message,
-    const std::string& activeNav
-) {
+std::string renderCapturePage(const Capture& capture, const std::string& logTail,
+                              const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
     std::ostringstream html;
-    const std::string title = currentCollection
-        ? "Entries — " + currentCollection->name
-        : "Entries";
-    html << pageHeader(title, activeNav);
+    const bool active = capture.status == "queued" || capture.status == "crawling";
+    html << pageHeader(displayTitle(capture), "/captures", active ? autoRefresh(5) : "");
     renderMessage(html, message);
 
-    html << "<div class=\"page-title\">\n";
-    html << "<h1>Entries</h1>\n";
+    const std::string base = "/capture/" + std::to_string(capture.id);
+    html << "<div class=\"page-title\">\n<p class=\"muted\"><a href=\"" << htmlEscape(urlHistoryHref(capture.url))
+         << "\">&larr; All captures of this URL</a></p>\n"
+         << "<h1 class=\"break\">" << htmlEscape(displayTitle(capture)) << "</h1>\n"
+         << "<div class=\"inline-row\">" << statusBadge(capture.status) << timeTag(capture.timestamp)
+         << tagChips(capture.tags) << "</div>\n</div>\n";
 
-    if (!allCollections.empty()) {
-        html << "<div class=\"inline-row mt-1\">\n";
-        html << "<span class=\"muted\">Collection:</span>\n";
-        if (currentCollection) {
-            renderCollectionSwitcher(html, allCollections,
-                                     currentCollection->id, "/entries");
-            html << "<a href=\"/collection/" << currentCollection->id << "\">"
-                 << "<button class=\"btn-sm btn-secondary\" type=\"button\">Edit collection</button></a>\n";
-        } else {
-            renderCollectionSwitcher(html, allCollections, 0, "/entries");
-        }
-        html << "</div>\n";
+    if (capture.error && !capture.error->empty()) {
+        html << "<div class=\"message " << (capture.status == "archived" ? "warning" : "error") << "\">"
+             << htmlEscape(*capture.error) << "</div>\n";
     }
-    html << "</div>\n";
+    if (active) {
+        html << "<p class=\"recording-notice\">&#9679; "
+             << (capture.status == "queued" ? "Waiting in the crawl queue." : "The page is being crawled.")
+             << " This page refreshes automatically.</p>\n";
+    }
 
-    if (!currentCollection) {
-        html << "<div class=\"card\"><p class=\"muted\">No collection selected. "
-             << "<a href=\"/collections\">Create or select a collection</a> first.</p></div>\n";
+    // Actions
+    html << "<div class=\"card\">\n<div class=\"inline-row\">\n" << captureButtons(capture, false);
+    if (capture.status == "queued") {
+        html << "<form method=\"post\" action=\"" << base << "/cancel\"><button class=\"btn-secondary\">Cancel</button></form>\n";
+    }
+    if (capture.status == "crawling") {
+        html << "<form method=\"post\" action=\"" << base << "/stop\" title=\"Stop the crawl and keep the pages "
+             << "captured so far\"><button class=\"btn-secondary\">Stop crawl</button></form>\n";
+    }
+    if (capture.source == "crawl" && (capture.status == "failed" || capture.status == "cancelled")) {
+        html << "<form method=\"post\" action=\"" << base << "/retry\"><button>Retry</button></form>\n";
+    }
+    html << "<form method=\"post\" action=\"" << base << "/recapture\" title=\"Create a new capture of this URL\">"
+         << "<button class=\"btn-secondary\">Archive again</button></form>\n";
+    html << "<form method=\"post\" action=\"" << base << "/delete\" onsubmit=\"return confirm('Delete this capture "
+         << "and its archive file?')\"><button class=\"btn-danger\">Delete</button></form>\n";
+    html << "</div>\n</div>\n";
+
+    // Info
+    html << "<div class=\"card\">\n<h2>Capture</h2>\n<table class=\"info\">\n";
+    html << "<tr><th>URL</th><td class=\"mono break\"><a href=\"" << htmlEscape(capture.url)
+         << "\" target=\"_blank\" rel=\"noreferrer\">" << htmlEscape(capture.url) << "</a></td></tr>\n";
+    html << "<tr><th>Timestamp</th><td>" << timeTag(capture.timestamp) << " <span class=\"mono muted\">"
+         << htmlEscape(capture.timestamp) << "</span></td></tr>\n";
+    html << "<tr><th>Source</th><td>" << (capture.source == "upload" ? "uploaded file" : "crawl");
+    if (capture.source == "crawl") {
+        html << " · " << htmlEscape(crawlDepthLabel(capture));
+        if (capture.maxDepth != 0) {
+            html << " (max pages: "
+                 << (capture.pageLimit && *capture.pageLimit > 0 ? std::to_string(*capture.pageLimit) : "unlimited")
+                 << ")";
+        }
+    }
+    html << "</td></tr>\n";
+    if (capture.filePath) {
+        html << "<tr><th>File</th><td><span class=\"mono\">" << htmlEscape(*capture.filePath) << "</span> · "
+             << htmlEscape(capture.fileType.value_or("")) << " · <strong>" << sizeCell(capture) << "</strong>";
+        if (capture.sizeBytes) html << " <span class=\"muted\">(" << *capture.sizeBytes << " bytes)</span>";
+        html << "</td></tr>\n";
+    }
+    if (capture.sha256) {
+        html << "<tr><th>SHA-256</th><td class=\"mono small break\">" << htmlEscape(*capture.sha256) << "</td></tr>\n";
+    }
+    html << "<tr><th>Requested</th><td class=\"muted\">" << htmlEscape(capture.createdAt) << " UTC</td></tr>\n";
+    if (capture.startedAt) {
+        html << "<tr><th>Crawl started</th><td class=\"muted\">" << htmlEscape(*capture.startedAt) << " UTC</td></tr>\n";
+    }
+    if (capture.finishedAt) {
+        html << "<tr><th>Finished</th><td class=\"muted\">" << htmlEscape(*capture.finishedAt) << " UTC</td></tr>\n";
+    }
+    if (capture.note && !capture.note->empty()) {
+        html << "<tr><th>Note</th><td class=\"pre\">" << htmlEscape(*capture.note) << "</td></tr>\n";
+    }
+    html << "</table>\n</div>\n";
+
+    // Edit
+    html << "<div class=\"card\">\n<h2>Edit</h2>\n<form method=\"post\" action=\"" << base
+         << "/update\" class=\"stack\">\n"
+         << "<div class=\"form-group\"><label>URL</label><input type=\"text\" name=\"url\" required value=\""
+         << htmlEscape(capture.url) << "\"></div>\n"
+         << "<div class=\"form-group\"><label>Title</label><input type=\"text\" name=\"title\" value=\""
+         << htmlEscape(capture.title.value_or("")) << "\"></div>\n"
+         << "<div class=\"form-group\"><label>Tags</label>" << tagInput("edit-tags", joinTags(capture.tags), allTags)
+         << "</div>\n"
+         << "<div class=\"form-group\"><label>Note</label><textarea name=\"note\" rows=\"3\">"
+         << htmlEscape(capture.note.value_or("")) << "</textarea></div>\n"
+         << "<div><button type=\"submit\">Save changes</button></div>\n</form>\n</div>\n";
+
+    if (!logTail.empty()) {
+        html << "<div class=\"card\">\n<h2>Crawl log</h2>\n<pre class=\"log\">" << htmlEscape(logTail)
+             << "</pre>\n</div>\n";
+    }
+
+    html << pageFooter();
+    return html.str();
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+std::string renderTagsPage(const std::vector<TagCount>& tags, const std::optional<std::string>& message) {
+    std::ostringstream html;
+    html << pageHeader("Tags", "/tags");
+    renderMessage(html, message);
+    html << "<div class=\"page-title\"><h1>Tags</h1><p class=\"muted\">" << tags.size()
+         << " tags. Click a tag to see its captures.</p></div>\n";
+
+    if (tags.empty()) {
+        html << "<div class=\"card\"><p class=\"muted\">No tags yet. Add tags when saving a page.</p></div>\n";
         html << pageFooter();
         return html.str();
     }
 
-    // Create new entry form
-    html << "<div class=\"card\">\n<h2>New entry in \"" << htmlEscape(currentCollection->name) << "\"</h2>\n";
-    html << "<form method=\"post\" action=\"/entry/new\">\n";
-    html << "<input type=\"hidden\" name=\"collection_id\" value=\"" << currentCollection->id << "\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "  <input type=\"url\" name=\"url\" required placeholder=\"https://example.com\" size=\"44\">\n";
-    html << "  <input type=\"text\" name=\"title\" placeholder=\"Optional title\" size=\"28\">\n";
-    html << "  <select name=\"capture_depth\">\n";
-    html << "    <option value=\"CURRENT_PAGE_ONLY\">Page only</option>\n";
-    html << "    <option value=\"CURRENT_PAGE_AND_SUBPAGES\">Page + subpages</option>\n";
-    html << "  </select>\n";
-    html << "  <button type=\"submit\">Create entry</button>\n";
-    html << "</div>\n</form>\n</div>\n";
-
-    // Entries table
-    html << "<div class=\"card\">\n";
-    renderEntriesTable(html, entries, false);
+    int maxCount = 1;
+    for (const auto& tag : tags) maxCount = std::max(maxCount, tag.count);
+    html << "<div class=\"card tag-cloud\">\n";
+    for (const auto& tag : tags) {
+        const double size = 0.85 + 0.9 * static_cast<double>(tag.count) / maxCount;
+        html << "<a class=\"tag\" style=\"font-size:" << std::format("{:.2f}", size) << "rem\" href=\"/captures?tag="
+             << urlEncode(tag.name) << "\">" << htmlEscape(tag.name) << " <span class=\"count\">" << tag.count
+             << "</span></a>\n";
+    }
     html << "</div>\n";
 
+    html << "<div class=\"card\">\n<h2>Manage tags</h2>\n<div class=\"table-wrap\"><table>\n"
+         << "<thead><tr><th>Tag</th><th class=\"num\">Captures</th><th>Rename / merge</th><th></th></tr></thead>\n<tbody>\n";
+    for (const auto& tag : tags) {
+        html << "<tr><td><a class=\"tag\" href=\"/captures?tag=" << urlEncode(tag.name) << "\">"
+             << htmlEscape(tag.name) << "</a></td><td class=\"num\">" << tag.count << "</td>"
+             << "<td><form method=\"post\" action=\"/tags/rename\"><input type=\"hidden\" name=\"from\" value=\""
+             << htmlEscape(tag.name) << "\"><input type=\"text\" name=\"to\" value=\"" << htmlEscape(tag.name)
+             << "\" size=\"18\"><button class=\"btn-sm btn-secondary\">Rename</button></form></td>"
+             << "<td><form method=\"post\" action=\"/tags/delete\" onsubmit=\"return confirm('Remove tag &quot;"
+             << htmlEscape(tag.name) << "&quot; from all captures? The captures are kept.')\">"
+             << "<input type=\"hidden\" name=\"name\" value=\"" << htmlEscape(tag.name) << "\">"
+             << "<button class=\"btn-sm btn-danger\">Delete</button></form></td></tr>\n";
+    }
+    html << "</tbody></table></div>\n<p class=\"muted small\">Renaming onto an existing tag merges the two tags.</p>\n"
+         << "</div>\n";
     html << pageFooter();
     return html.str();
 }
 
 // ---------------------------------------------------------------------------
-// Entry detail page
+// Upload
 // ---------------------------------------------------------------------------
 
-std::string renderEntryDetailPage(
-    const Entry& entry,
-    const std::vector<ArchiveFile>& archiveFiles,
-    const std::vector<CrawlRun>& crawlRuns,
-    const std::optional<std::string>& message
-) {
+std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
     std::ostringstream html;
-    html << pageHeader("Entry #" + std::to_string(entry.numberPerCollection)
-                      + " — " + entry.collectionName, "entries");
+    html << pageHeader("Upload archive", "/upload");
     renderMessage(html, message);
-
-    // Auto-refresh every 20 seconds when a crawl is in progress so the user
-    // sees the status change to "archived" without manually reloading.
-    if (entry.status == "recording") {
-        html << "<script>\n";
-        html << "(function() {\n";
-        html << "  var CHECK_URL = '/entry/" << entry.id << "/check';\n";
-        html << "  var INTERVAL_MS = 20000;\n";
-        html << "  function poll() {\n";
-        html << "    fetch(CHECK_URL, {method:'GET', redirect:'follow'})\n";
-        html << "      .then(function(r) { if (r.ok || r.redirected) window.location.reload(); })\n";
-        html << "      .catch(function() {});\n";
-        html << "  }\n";
-        html << "  var timer = setInterval(function() {\n";
-        html << "    fetch('/entry/" << entry.id << "', {method:'GET'})\n";
-        html << "      .then(function(r) { return r.text(); })\n";
-        html << "      .then(function(body) {\n";
-        html << "        if (body.indexOf('status-recording') === -1) { clearInterval(timer); window.location.reload(); return; }\n";
-        html << "        poll();\n";
-        html << "      })\n";
-        html << "      .catch(function() {});\n";
-        html << "  }, INTERVAL_MS);\n";
-        html << "})();\n";
-        html << "</script>\n";
-    }
-
-    html << "<div class=\"page-title\">\n";
-    html << "<p class=\"muted\"><a href=\"/collections/" << entry.collectionId
-         << "/entries\">&#8592; " << htmlEscape(entry.collectionName) << "</a></p>\n";
-    html << "<h1><span class=\"num-badge\">#" << entry.numberPerCollection << "</span> "
-         << htmlEscape(displayTitle(entry)) << "</h1>\n";
-    html << "</div>\n";
-
-    // Entry info card
-    html << "<div class=\"card\">\n<h2>Entry info</h2>\n";
-    html << "<table>\n";
-    html << "<tr><th>Collection</th><td>" << htmlEscape(entry.collectionName) << "</td></tr>\n";
-    html << "<tr><th>Number</th><td>#" << entry.numberPerCollection << "</td></tr>\n";
-    html << "<tr><th>URL</th><td class=\"mono\"><a href=\"" << htmlEscape(entry.url) << "\" target=\"_blank\">"
-         << htmlEscape(entry.url) << "</a></td></tr>\n";
-    html << "<tr><th>Status</th><td>" << statusBadge(entry.status) << "</td></tr>\n";
-    html << "<tr><th>Depth</th><td>" << htmlEscape(captureDepthLabel(entry.captureDepth)) << "</td></tr>\n";
-    html << "<tr><th>Created</th><td class=\"muted\">" << htmlEscape(entry.createdAt) << "</td></tr>\n";
-    if (entry.archivedAt) {
-        html << "<tr><th>Archived</th><td class=\"muted\">" << htmlEscape(*entry.archivedAt) << "</td></tr>\n";
-    }
-    if (entry.note && !entry.note->empty()) {
-        html << "<tr><th>Note</th><td>" << htmlEscape(*entry.note) << "</td></tr>\n";
-    }
-    if (entry.lastError && !entry.lastError->empty()) {
-        html << "<tr><th>Last error</th><td class=\"error-text\">" << htmlEscape(*entry.lastError) << "</td></tr>\n";
-    }
-    html << "</table>\n";
-
-    // Entry edit form
-    html << "<h3 class=\"mt-2\">Edit entry</h3>\n";
-    html << "<form method=\"post\" action=\"/entry/" << entry.id << "/update\">\n";
-    html << "<div class=\"form-group\">\n";
-    html << "  <label>URL</label>\n";
-    html << "  <input type=\"url\" name=\"url\" required value=\"" << htmlEscape(entry.url) << "\" style=\"width:100%;max-width:480px;\">\n";
-    html << "</div>\n";
-    html << "<div class=\"form-group\">\n";
-    html << "  <label>Title</label>\n";
-    html << "  <input type=\"text\" name=\"title\" value=\"" << htmlEscape(entry.title.value_or("")) << "\" size=\"44\">\n";
-    html << "</div>\n";
-    html << "<div class=\"form-group\">\n";
-    html << "  <label>Note</label>\n";
-    html << "  <textarea name=\"note\" rows=\"3\" style=\"width:100%;max-width:480px;\">" << htmlEscape(entry.note.value_or("")) << "</textarea>\n";
-    html << "</div>\n";
-    html << "<div class=\"form-group\">\n";
-    html << "  <label>Depth</label>\n";
-    html << "  <select name=\"capture_depth\">\n";
-    const char* depthValues[] = {"CURRENT_PAGE_ONLY", "CURRENT_PAGE_AND_SUBPAGES", nullptr};
-    const char* depthLabels[] = {"Page only", "Page + subpages", nullptr};
-    for (int i = 0; depthValues[i] != nullptr; ++i) {
-        html << "    <option value=\"" << depthValues[i] << "\"";
-        if (captureDepthToString(entry.captureDepth) == depthValues[i]) html << " selected";
-        html << ">" << depthLabels[i] << "</option>\n";
-    }
-    html << "  </select>\n";
-    html << "</div>\n";
-    html << "<button type=\"submit\">Save changes</button>\n";
-    html << "</form>\n";
-
-    // Status change form
-    html << "<h3 class=\"mt-2\">Change status</h3>\n";
-    html << "<form method=\"post\" action=\"/entry/" << entry.id << "/status\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "<select name=\"status\">\n";
-    const char* statuses[] = {
-        "new", "queued", "recording", "archived", "imported",
-        "failed", "needs_review", "ignored", nullptr
-    };
-    for (int i = 0; statuses[i] != nullptr; ++i) {
-        html << "<option value=\"" << statuses[i] << "\"";
-        if (entry.status == statuses[i]) html << " selected";
-        html << ">" << statuses[i] << "</option>\n";
-    }
-    html << "</select>\n";
-    html << "<button type=\"submit\">Update status</button>\n";
-    html << "</div>\n</form>\n";
-    html << "</div>\n";
-
-    // Browsertrix recording actions
-    html << "<div class=\"card\">\n<h2>Browsertrix recording</h2>\n";
-    if (entry.status == "recording") {
-        html << "<p class=\"recording-notice\">&#9679; Crawl is running in the background. "
-             << "The page auto-checks every 20&nbsp;s and will reload when the crawl finishes.</p>\n";
-    }
-    html << "<div class=\"inline-row\">\n";
-    html << "<form method=\"post\" action=\"/entry/" << entry.id << "/start\">"
-         << "<button type=\"submit\">Start recording</button></form>\n";
-    html << "<a href=\"/entry/" << entry.id << "/check\" class=\"btn btn-secondary\">Check / auto-stop if done</a>\n";
-    html << "<form method=\"post\" action=\"/entry/" << entry.id << "/stop\">"
-         << "<button class=\"btn-secondary\" type=\"submit\">Stop recording (force)</button></form>\n";
-    html << "</div>\n</div>\n";
-
-    // Archive files
-    html << "<div class=\"card\">\n<h2>Archive files (" << archiveFiles.size() << ")</h2>\n";
-    renderArchiveFilesList(html, archiveFiles, entry.id);
-
-    // Upload form
-    html << "<h3 class=\"mt-2\">Upload archive file</h3>\n";
-    html << "<form method=\"post\" action=\"/entry/" << entry.id
-         << "/upload\" enctype=\"multipart/form-data\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "  <input type=\"file\" name=\"file\" accept=\".warc,.warc.gz,.wacz\" required>\n";
-    html << "  <input type=\"text\" name=\"label\" placeholder=\"Optional label (e.g. manual import)\" size=\"28\">\n";
-    html << "  <button type=\"submit\">Upload</button>\n";
-    html << "</div>\n";
-    html << "<p class=\"muted\">Accepted: .warc, .warc.gz, .wacz</p>\n";
-    html << "</form>\n";
-    html << "</div>\n";
-
-    // Replay section
-    const bool hasWacz = !archiveFiles.empty() && [&]() {
-        for (const auto& af : archiveFiles) {
-            if (af.fileType == "wacz") return true;
-        }
-        return false;
-    }();
-
-    if (hasWacz) {
-        html << "<div class=\"card\">\n<h2>Replay</h2>\n";
-        html << "<form method=\"get\" action=\"/entry/" << entry.id << "/replay/latest\" target=\"_blank\">"
-             << "<button type=\"submit\">Replay latest WACZ</button></form>\n";
-        html << "</div>\n";
-    }
-
-    // Crawl runs history
-    html << "<div class=\"card\">\n<h2>Crawl run history (" << crawlRuns.size() << ")</h2>\n";
-    if (crawlRuns.empty()) {
-        html << "<p class=\"muted\">No crawl runs recorded yet.</p>\n";
-    } else {
-        html << "<table>\n";
-        html << "<thead><tr>"
-             << "<th>#</th><th>Status</th><th>Browsertrix ID</th>"
-             << "<th>Container</th><th>Started</th><th>Stopped</th>"
-             << "<th>Exit</th><th>Error</th>"
-             << "</tr></thead>\n<tbody>\n";
-        for (const auto& cr : crawlRuns) {
-            html << "<tr>";
-            html << "<td class=\"mono\">" << cr.id << "</td>";
-            html << "<td>" << statusBadge(cr.status) << "</td>";
-            html << "<td class=\"mono\">" << htmlEscape(cr.browsertrixId.value_or("—")) << "</td>";
-            html << "<td class=\"mono\">" << htmlEscape(cr.dockerContainerId.value_or("—")) << "</td>";
-            html << "<td class=\"muted\">" << htmlEscape(cr.startedAt.value_or("—")) << "</td>";
-            html << "<td class=\"muted\">" << htmlEscape(cr.stoppedAt.value_or("—")) << "</td>";
-            html << "<td>";
-            if (cr.exitCode) html << *cr.exitCode;
-            else html << "—";
-            html << "</td>";
-            html << "<td>";
-            if (cr.errorMessage && !cr.errorMessage->empty()) {
-                html << "<span class=\"error-text\">" << htmlEscape(*cr.errorMessage) << "</span>";
-            } else {
-                html << "—";
-            }
-            html << "</td>";
-            html << "</tr>\n";
-        }
-        html << "</tbody></table>\n";
-    }
-    html << "</div>\n";
-
-    // Delete entry
-    html << "<div class=\"card\">\n<h2>Danger zone</h2>\n";
-    html << "<form method=\"post\" action=\"/entry/" << entry.id
-         << "/delete\" onsubmit=\"return confirm('Delete this entry and all its archive files?')\">"
-         << "<button class=\"btn-danger\" type=\"submit\">Delete entry</button></form>\n";
-    html << "</div>\n";
-
+    html << "<div class=\"card\">\n<h1>Upload a WARC / WACZ file</h1>\n"
+         << "<p class=\"muted\">The file becomes a capture of its own. URL, date and title are read from the file "
+         << "when you leave them empty.</p>\n"
+         << "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\" class=\"stack\">\n"
+         << "<div class=\"form-group\"><label>File (.warc, .warc.gz, .wacz)</label>"
+         << "<input type=\"file\" name=\"file\" accept=\".warc,.gz,.wacz\" required></div>\n"
+         << "<div class=\"form-group\"><label>URL</label><input type=\"text\" name=\"url\" "
+         << "placeholder=\"detected from the file\"></div>\n"
+         << "<div class=\"form-group\"><label>Tags</label>" << tagInput("upload-tags", "", allTags) << "</div>\n"
+         << "<div class=\"form-row\">\n"
+         << "<div class=\"form-group grow\"><label>Title</label><input type=\"text\" name=\"title\" "
+         << "placeholder=\"detected from the file\"></div>\n"
+         << "<div class=\"form-group\"><label>Capture date (UTC)</label><input type=\"text\" name=\"timestamp\" "
+         << "placeholder=\"YYYYMMDDhhmmss or 2026-09-23 18:02\"></div>\n"
+         << "</div>\n"
+         << "<div class=\"form-group\"><label>Note</label><textarea name=\"note\" rows=\"2\"></textarea></div>\n"
+         << "<div><button type=\"submit\">Upload</button></div>\n"
+         << "</form>\n</div>\n";
     html << pageFooter();
     return html.str();
 }
 
 // ---------------------------------------------------------------------------
-// Archive files browser page
+// Replay
 // ---------------------------------------------------------------------------
 
-std::string renderArchiveFilesPage(
-    const std::optional<Collection>& currentCollection,
-    const std::vector<Collection>& allCollections,
-    const std::vector<ArchiveFile>& archiveFiles,
-    const std::vector<Entry>& entries,
-    const std::optional<std::string>& message
-) {
-    // Build a map from entry_id → entry for quick lookup
-    std::map<int, const Entry*> entryMap;
-    for (const auto& e : entries) {
-        entryMap[e.id] = &e;
-    }
-
+std::string renderReplayPage(const Capture& capture, const std::string& archiveSource) {
     std::ostringstream html;
-    const std::string title = currentCollection
-        ? "Archive Files — " + currentCollection->name
-        : "Archive Files";
-    html << pageHeader(title, "archives");
-    renderMessage(html, message);
-
-    html << "<div class=\"page-title\">\n<h1>Archive Files</h1>\n";
-    if (!allCollections.empty() && currentCollection) {
-        html << "<div class=\"inline-row mt-1\"><span class=\"muted\">Collection:</span>\n";
-        renderCollectionSwitcher(html, allCollections, currentCollection->id, "/archives-browser");
-        html << "</div>\n";
-    }
-    html << "</div>\n";
-
-    html << "<div class=\"card\">\n";
-    html << "<table>\n<thead><tr>\n";
-    html << "  <th>#</th><th>Entry</th><th>Type</th><th>Source</th>"
-         << "<th>Label</th><th>Size</th><th>Created</th><th>Actions</th>\n";
-    html << "</tr></thead>\n<tbody>\n";
-
-    if (archiveFiles.empty()) {
-        html << "<tr><td colspan=\"8\" class=\"muted\">No archive files.</td></tr>\n";
-    }
-
-    for (const auto& af : archiveFiles) {
-        const auto* entryPtr = entryMap.count(af.entryId) ? entryMap.at(af.entryId) : nullptr;
-        const auto slash = af.path.rfind('/');
-        const std::string fname = slash == std::string::npos ? af.path : af.path.substr(slash + 1);
-
-        html << "<tr>\n";
-        if (entryPtr) {
-            html << "  <td><span class=\"num-badge\">#" << entryPtr->numberPerCollection << "</span></td>\n";
-            html << "  <td><a href=\"/entry/" << af.entryId << "\">"
-                 << htmlEscape(displayTitle(*entryPtr)) << "</a></td>\n";
-        } else {
-            html << "  <td>—</td>\n";
-            html << "  <td class=\"muted\">entry #" << af.entryId << "</td>\n";
-        }
-        html << "  <td><span class=\"badge\" style=\"background:#444\">"
-             << htmlEscape(af.fileType) << "</span></td>\n";
-        html << "  <td class=\"muted\">" << htmlEscape(af.source.value_or("")) << "</td>\n";
-        html << "  <td class=\"muted\">" << htmlEscape(af.label.value_or("")) << "</td>\n";
-        html << "  <td class=\"muted\">" << (af.sizeBytes ? formatBytes(*af.sizeBytes) : "—") << "</td>\n";
-        html << "  <td class=\"muted\">" << htmlEscape(af.createdAt.substr(0, 10)) << "</td>\n";
-        html << "  <td class=\"td-actions\">\n";
-        if (af.fileType == "wacz") {
-            html << "    <form method=\"get\" action=\"/archive/" << af.id << "/replay\" target=\"_blank\">"
-                 << "<button class=\"btn-sm\" type=\"submit\">Replay</button></form>\n";
-        } else {
-            html << "    <span class=\"muted\" style=\"font-size:0.8rem\">WARC replay N/A</span>\n";
-        }
-        html << "  </td>\n";
-        html << "</tr>\n";
-    }
-
-    html << "</tbody>\n</table>\n</div>\n";
-    html << pageFooter();
+    html << "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+         << "<title>" << htmlEscape(displayTitle(capture)) << " (" << htmlEscape(formatTimestamp(capture.timestamp))
+         << ") — warc-studio</title>\n"
+         << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n"
+         // ui.js is loaded from /replay/ui.js — same path as replayBase so SW registration works.
+         << "<script src=\"/replay/ui.js\"></script>\n"
+         << "<style>\n"
+         << "html,body{margin:0;padding:0;width:100%;height:100%;}\n"
+         << "body{display:flex;flex-direction:column;}\n"
+         << "replay-web-page{display:block;width:100%;flex:1;}\n"
+         << ".replay-bar{background:#1a2332;color:#d0dde8;padding:6px 12px;font-family:system-ui,sans-serif;"
+         << "font-size:13px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;}\n"
+         << ".replay-bar a{color:#90caf9;text-decoration:none;}\n"
+         << ".replay-bar .url{color:#aed6a0;word-break:break-all;}\n"
+         << "</style>\n</head>\n<body>\n<div class=\"replay-bar\">\n"
+         << "<a href=\"/capture/" << capture.id << "\">&larr; Capture</a>\n"
+         << "<strong>" << htmlEscape(formatTimestamp(capture.timestamp)) << " UTC</strong>\n"
+         << "<span class=\"url\">" << htmlEscape(capture.url) << "</span>\n"
+         << "<a href=\"" << htmlEscape(urlHistoryHref(capture.url)) << "\">other captures</a>\n"
+         << "<a href=\"/capture/" << capture.id << "/download\" style=\"margin-left:auto\">&#11015; Download "
+         << htmlEscape(capture.fileType.value_or("")) << "</a>\n</div>\n";
+    // <replay-web-page> web component:
+    // - source: relative same-origin path to the archive (no mixed content)
+    // - url: the original archived URL, so the page opens directly
+    // - replayBase: where to find ui.js and sw.js (must match where the SW is served)
+    // - embed="default": renders inside an iframe scoped to replayBase — SW scope covers it
+    const auto resolvedUrl = resolveUrl(capture.url, capture.url);  // "https://x.org" -> "https://x.org/"
+    html << "<replay-web-page source=\"" << htmlEscape(archiveSource) << "\" url=\""
+         << htmlEscape(resolvedUrl.empty() ? capture.url : resolvedUrl)
+         << "\" replayBase=\"/replay/\" embed=\"default\"></replay-web-page>\n</body>\n</html>\n";
     return html.str();
 }
 
 // ---------------------------------------------------------------------------
-// About / settings page
+// About
 // ---------------------------------------------------------------------------
 
-std::string renderAboutPage(
-    const std::string& dataDir,
-    const std::string& browsertrixImage,
-    bool runBrowsertrix,
-    const std::string& appVersion
-) {
+std::string renderAboutPage(const AboutView& view) {
     std::ostringstream html;
-    html << pageHeader("About", "about");
-
+    html << pageHeader("About", "/about");
     html << "<div class=\"page-title\"><h1>Settings &amp; About</h1></div>\n";
-    html << "<div class=\"card\">\n<h2>Application info</h2>\n";
-    html << "<table>\n";
-    html << "<tr><th>Version</th><td>" << htmlEscape(appVersion) << "</td></tr>\n";
-    html << "<tr><th>Data directory</th><td class=\"mono\">" << htmlEscape(dataDir) << "</td></tr>\n";
-    html << "<tr><th>Browsertrix image</th><td class=\"mono\">" << htmlEscape(browsertrixImage) << "</td></tr>\n";
-    html << "<tr><th>Browsertrix enabled</th><td>"
-         << (runBrowsertrix ? "<span class=\"badge badge-archived\">yes</span>"
-                            : "<span class=\"badge badge-failed\">no</span>")
-         << "</td></tr>\n";
-    html << "</table>\n</div>\n";
 
-    html << "<div class=\"card\">\n<h2>Technology stack</h2>\n";
-    html << "<ul>\n";
-    html << "<li>C++23 / CMake</li>\n";
-    html << "<li><a href=\"https://crowcpp.org/\" target=\"_blank\">Crow</a> HTTP server</li>\n";
-    html << "<li>SQLite (direct, no ORM)</li>\n";
-    html << "<li><a href=\"https://crawler.docs.browsertrix.com/\" target=\"_blank\">Browsertrix Crawler</a> (Docker)</li>\n";
-    html << "<li><a href=\"https://replayweb.page/\" target=\"_blank\">ReplayWeb.page</a></li>\n";
-    html << "</ul>\n</div>\n";
+    const std::string bookmarklet =
+        "javascript:(function(){window.open('" + view.baseUrl
+        + "/?url='+encodeURIComponent(location.href)+'&title='+encodeURIComponent(document.title));})();";
+    html << "<div class=\"card\" id=\"bookmarklet\">\n<h2>Bookmarklet</h2>\n"
+         << "<p>Drag this link to your bookmarks bar. Clicking it on any page opens warc-studio with the page's URL "
+         << "filled in, shows whether it is already archived and lets you save it with tags.</p>\n"
+         << "<p><a class=\"btn\" href=\"" << htmlEscape(bookmarklet) << "\">Save to warc-studio</a></p>\n</div>\n";
 
-    html << pageFooter();
-    return html.str();
-}
+    html << "<div class=\"card\">\n<h2>Wayback-style URLs</h2>\n<ul>\n"
+         << "<li><span class=\"mono\">" << htmlEscape(view.baseUrl) << "/web/*/example.com</span> — all captures of a URL</li>\n"
+         << "<li><span class=\"mono\">" << htmlEscape(view.baseUrl) << "/web/20260101000000/example.com</span> — replay "
+         << "the capture closest to a timestamp</li>\n</ul>\n</div>\n";
 
-// ---------------------------------------------------------------------------
-// Replay embed page
-// ---------------------------------------------------------------------------
+    const auto& s = view.stats;
+    html << "<div class=\"card\">\n<h2>Archive</h2>\n<table class=\"info\">\n"
+         << "<tr><th>Captures</th><td>" << s.captures << " (" << s.archived << " archived, " << s.queued
+         << " queued, " << s.crawling << " crawling, " << s.failed << " failed)</td></tr>\n"
+         << "<tr><th>Distinct URLs</th><td>" << s.urls << "</td></tr>\n"
+         << "<tr><th>Archive size</th><td>" << formatBytes(s.totalBytes) << "</td></tr>\n"
+         << "</table>\n</div>\n";
 
-std::string renderReplayPage(const std::string& sourceUrl, const std::string& title) {
-    std::ostringstream html;
-    // Minimal standalone page — no nav, no external CSS dependency needed.
-    // We embed the ReplayWeb.page UI script so the WACZ is fetched from our
-    // HTTP origin, avoiding the HTTPS→HTTP mixed-content block.
-    html << "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
-    html << "<meta charset=\"UTF-8\">\n";
-    html << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
-    html << "<title>Replay: " << htmlEscape(title) << " — warc-studio</title>\n";
-    html << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n";
-    html << "<style>\n";
-    html << "html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #eee; font-family: sans-serif; }\n";
-    html << ".topbar { display: flex; align-items: center; gap: 1rem; padding: 0.5rem 1rem; background: #1a1a2e; border-bottom: 1px solid #333; }\n";
-    html << ".topbar a { color: #7ec8e3; text-decoration: none; font-size: 0.9rem; }\n";
-    html << ".topbar .label { color: #aaa; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60vw; }\n";
-    html << "replay-web-page { display: block; width: 100%; height: calc(100vh - 46px); }\n";
-    html << "</style>\n";
-    // ReplayWeb.page UI bundle — served locally so that both the script and
-    // the WACZ fetch come from the same HTTP origin.  This avoids the
-    // HTTPS→HTTP mixed-content block that occurs when loading ui.js from CDN.
-    // The service worker is at /replay/sw.js with scope /replay/ (as recommended
-    // by the ReplayWeb.page documentation for self-hosted deployments).
-    // Load ui.js from /replay/ui.js — same path prefix as replayBase="/replay/"
-    // so the web component resolves all sub-resources (including sw.js) consistently.
-    html << "<script src=\"/replay/ui.js\"></script>\n";
-    html << "</head>\n<body>\n";
-    html << "<div class=\"topbar\">\n";
-    html << "  <a href=\"/\">&#8592; warc-studio</a>\n";
-    html << "  <span class=\"label\">Replaying: " << htmlEscape(title) << "</span>\n";
-    html << "  <a href=\"" << htmlEscape(sourceUrl) << "\" download style=\"margin-left:auto\">&#11015; Download WACZ</a>\n";
-    html << "</div>\n";
-    html << "<replay-web-page source=\"" << htmlEscape(sourceUrl) << "\""
-         << " replayBase=\"/replay/\""
-         << " embed=\"default\""
-         << "></replay-web-page>\n";
-    html << "</body>\n</html>\n";
-    return html.str();
-}
+    html << "<div class=\"card\">\n<h2>Configuration</h2>\n<table class=\"info\">\n"
+         << "<tr><th>Version</th><td>" << htmlEscape(view.appVersion) << "</td></tr>\n"
+         << "<tr><th>Data directory</th><td class=\"mono\">" << htmlEscape(view.dataDir) << "</td></tr>\n"
+         << "<tr><th>Parallel crawls</th><td>" << view.crawlWorkers << "</td></tr>\n"
+         << "<tr><th>Crawl time limit</th><td>"
+         << (view.crawlTimeLimitSeconds > 0 ? std::to_string(view.crawlTimeLimitSeconds) + " s" : "none") << "</td></tr>\n"
+         << "<tr><th>Max resource size</th><td>" << formatBytes(view.maxResourceBytes) << "</td></tr>\n"
+         << "<tr><th>User-Agent</th><td class=\"mono small break\">" << htmlEscape(view.userAgent) << "</td></tr>\n"
+         << "</table>\n</div>\n";
 
-// ---------------------------------------------------------------------------
-// Legacy pages — kept for backward compatibility
-// ---------------------------------------------------------------------------
-
-namespace {
-
-void renderEntryRowsLegacy(std::ostringstream& html, const std::vector<Entry>& entries,
-                     const std::map<int, ArchiveFile>& latestArchiveFiles) {
-    for (const auto& entry : entries) {
-        const auto archiveIt = latestArchiveFiles.find(entry.id);
-        const bool hasArchive = archiveIt != latestArchiveFiles.end();
-
-        html << "      <tr>\n";
-        html << "        <td><span class=\"num-badge\">#" << entry.numberPerCollection << "</span></td>\n";
-        html << "        <td>" << htmlEscape(entry.collectionName) << "</td>\n";
-
-        html << "        <td><a href=\"/entry/" << entry.id << "\"><strong>"
-             << htmlEscape(displayTitle(entry)) << "</strong></a>"
-             << "<br><span class=\"muted mono\">" << htmlEscape(entry.url) << "</span></td>\n";
-
-        html << "        <td>" << statusBadge(entry.status);
-        if (entry.lastError && !entry.lastError->empty()) {
-            html << "<div class=\"error-text\">" << htmlEscape(*entry.lastError) << "</div>";
-        }
-        html << "</td>\n";
-
-        html << "        <td class=\"muted\">";
-        if (hasArchive) {
-            const auto& af = archiveIt->second;
-            const auto slash = af.path.rfind('/');
-            const std::string fname = slash == std::string::npos ? af.path : af.path.substr(slash + 1);
-            html << "<span class=\"mono\" title=\"" << htmlEscape(af.path) << "\">" << htmlEscape(fname) << "</span>";
-        }
-        html << "</td>\n";
-
-        html << "        <td>\n";
-        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/start\">"
-             << "<button class=\"btn-secondary btn-sm\" type=\"submit\">Start rec</button></form>\n";
-        html << "          <form method=\"post\" action=\"/entry/" << entry.id << "/stop\">"
-             << "<button class=\"btn-secondary btn-sm\" type=\"submit\">Stop rec</button></form>\n";
-        if (hasArchive) {
-            html << "          <form method=\"get\" action=\"/entry/" << entry.id << "/replay/latest\" target=\"_blank\">"
-                 << "<button class=\"btn-sm\" type=\"submit\">Replay</button></form>\n";
-        }
-        html << "          <a href=\"/entry/" << entry.id << "\"><button class=\"btn-secondary btn-sm\" type=\"button\">Detail</button></a>\n";
-        html << "          <form method=\"post\" action=\"/entry/" << entry.id
-             << "/delete\" onsubmit=\"return confirm('Delete this entry?')\">"
-             << "<button class=\"btn-danger btn-sm\" type=\"submit\">Delete</button></form>\n";
-        html << "        </td>\n";
-        html << "      </tr>\n";
-    }
-
-    if (entries.empty()) {
-        html << "      <tr><td colspan=\"6\" class=\"muted\">No entries yet.</td></tr>\n";
-    }
-}
-
-} // anonymous namespace
-
-std::string renderIndexPage(
-    const std::vector<Collection>& collections,
-    const std::vector<Entry>& entries,
-    const std::map<int, ArchiveFile>& latestArchiveFiles,
-    const std::optional<std::string>& message
-) {
-    std::ostringstream html;
-    html << pageHeader("warc-studio", "collections");
-
-    renderMessage(html, message);
-
-    // Collections section
-    html << "<div class=\"page-title\"><h1>warc-studio</h1>"
-         << "<p class=\"muted\">C++23 + Crow + SQLite + Browsertrix + ReplayWeb.page</p></div>\n";
-
-    html << "<div class=\"card\">\n<h2>Collections</h2>\n";
-    html << "<table>\n<thead><tr>\n";
-    html << "  <th>Name</th><th>Description</th><th>Created</th><th>Actions</th>\n";
-    html << "</tr></thead>\n<tbody>\n";
-
-    for (const auto& col : collections) {
-        html << "  <tr>\n";
-        html << "    <td><a href=\"/collections/" << col.id << "/entries\">"
-             << htmlEscape(col.name) << "</a></td>\n";
-        html << "    <td class=\"muted\">" << htmlEscape(col.description.value_or("")) << "</td>\n";
-        html << "    <td class=\"muted\">" << htmlEscape(col.createdAt.substr(0, 10)) << "</td>\n";
-        html << "    <td class=\"td-actions\">\n";
-        html << "      <a href=\"/collections/" << col.id << "/entries\">"
-             << "<button class=\"btn-sm\" type=\"button\">Open entries</button></a>\n";
-        html << "      <form method=\"post\" action=\"/collection/" << col.id
-             << "/delete\" onsubmit=\"return confirm('Delete collection?')\">"
-             << "<button class=\"btn-danger btn-sm\" type=\"submit\">Delete</button></form>\n";
-        html << "    </td>\n";
-        html << "  </tr>\n";
-    }
-    if (collections.empty()) {
-        html << "  <tr><td colspan=\"4\" class=\"muted\">No collections yet.</td></tr>\n";
-    }
-    html << "</tbody>\n</table>\n</div>\n";
-
-    html << "<div class=\"card\">\n<h2>New collection</h2>\n";
-    html << "<form method=\"post\" action=\"/collection/new\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "  <input type=\"text\" name=\"name\" required placeholder=\"Collection name\">\n";
-    html << "  <input type=\"text\" name=\"description\" placeholder=\"Optional description\" size=\"40\">\n";
-    html << "  <button type=\"submit\">Create collection</button>\n";
-    html << "</div>\n</form>\n</div>\n";
-
-    html << "<div class=\"card\">\n<h2>New entry</h2>\n";
-    html << "<form method=\"post\" action=\"/entry/new\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "<select name=\"collection_id\" required>\n";
-    for (const auto& collection : collections) {
-        html << "<option value=\"" << collection.id << "\">" << htmlEscape(collection.name) << "</option>\n";
-    }
-    html << "</select>\n";
-    html << "<input type=\"url\" name=\"url\" required placeholder=\"https://example.com\" size=\"42\">\n";
-    html << "<input type=\"text\" name=\"title\" placeholder=\"Optional title\" size=\"28\">\n";
-    html << "<button type=\"submit\">Create entry</button>\n";
-    html << "</div>\n</form>\n</div>\n";
-
-    html << "<div class=\"card\">\n<h2>All entries</h2>\n";
-    html << "<table>\n<thead><tr>\n";
-    html << "  <th>#</th><th>Collection</th><th>Title / URL</th><th>Status</th>"
-         << "<th>Archive</th><th>Actions</th>\n";
-    html << "</tr></thead>\n<tbody>\n";
-    renderEntryRowsLegacy(html, entries, latestArchiveFiles);
-    html << "</tbody>\n</table>\n</div>\n";
-
-    html << pageFooter();
-    return html.str();
-}
-
-std::string renderCollectionDetailPage(
-    const Collection& collection,
-    const std::vector<Entry>& entries,
-    const std::map<int, ArchiveFile>& latestArchiveFiles,
-    const std::optional<std::string>& message
-) {
-    std::ostringstream html;
-    html << pageHeader("Collection: " + collection.name, "collections");
-
-    html << "<p class=\"muted\"><a href=\"/\">&#8592; Back to collections</a></p>\n";
-
-    renderMessage(html, message);
-
-    html << "<div class=\"card\">\n";
-    html << "<h2>Collection: " << htmlEscape(collection.name) << "</h2>\n";
-    if (collection.description && !collection.description->empty()) {
-        html << "<p class=\"muted\">" << htmlEscape(*collection.description) << "</p>\n";
-    }
-    html << "<p class=\"muted\">Created: " << htmlEscape(collection.createdAt) << "</p>\n";
-
-    html << "<h3>Edit collection</h3>\n";
-    html << "<form method=\"post\" action=\"/collection/" << collection.id << "/edit\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "<input type=\"text\" name=\"name\" required value=\"" << htmlEscape(collection.name) << "\">\n";
-    html << "<input type=\"text\" name=\"description\" placeholder=\"Description\" size=\"40\" value=\""
-         << htmlEscape(collection.description.value_or("")) << "\">\n";
-    html << "<button type=\"submit\">Save changes</button>\n";
-    html << "</div>\n</form>\n";
-
-    html << "<h3>Delete collection</h3>\n";
-    html << "<form method=\"post\" action=\"/collection/" << collection.id
-         << "/delete\" onsubmit=\"return confirm('Delete collection &quot;" << htmlEscape(collection.name)
-         << "&quot; and ALL its entries?')\">\n";
-    html << "<button class=\"btn-danger\" type=\"submit\">Delete this collection</button>\n";
-    html << "</form>\n</div>\n";
-
-    // New entry form
-    html << "<div class=\"card\">\n<h2>Add entry to this collection</h2>\n";
-    html << "<form method=\"post\" action=\"/entry/new\">\n";
-    html << "<input type=\"hidden\" name=\"collection_id\" value=\"" << collection.id << "\">\n";
-    html << "<div class=\"form-row\">\n";
-    html << "<input type=\"url\" name=\"url\" required placeholder=\"https://example.com\" size=\"44\">\n";
-    html << "<input type=\"text\" name=\"title\" placeholder=\"Optional title\" size=\"28\">\n";
-    html << "<button type=\"submit\">Create entry</button>\n";
-    html << "</div>\n</form>\n</div>\n";
-
-    html << "<div class=\"card\">\n<h2>Entries in this collection</h2>\n";
-    html << "<table>\n<thead><tr>\n";
-    html << "  <th>#</th><th>Collection</th><th>Title / URL</th><th>Status</th>"
-         << "<th>Archive</th><th>Actions</th>\n";
-    html << "</tr></thead>\n<tbody>\n";
-    renderEntryRowsLegacy(html, entries, latestArchiveFiles);
-    html << "</tbody>\n</table>\n</div>\n";
+    html << "<div class=\"card\">\n<h2>Technology stack</h2>\n<ul>\n"
+         << "<li>C++23 / CMake</li>\n"
+         << "<li><a href=\"https://crowcpp.org/\" target=\"_blank\">Crow</a> HTTP server</li>\n"
+         << "<li>SQLite (direct, no ORM)</li>\n"
+         << "<li>Built-in crawler: <a href=\"https://curl.se/libcurl/\" target=\"_blank\">libcurl</a>, "
+         << "HTML/CSS link extraction, WARC 1.1 writer</li>\n"
+         << "<li><a href=\"https://replayweb.page/\" target=\"_blank\">ReplayWeb.page</a></li>\n"
+         << "</ul>\n</div>\n";
 
     html << pageFooter();
     return html.str();
