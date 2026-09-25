@@ -68,8 +68,10 @@ Each capture is crawled by warc-studio itself (`src/Crawler.cpp`) and written to
 portals such as seznam.cz are archived well; content that a page fetches with JavaScript through
 dynamically built URLs (single-page apps, infinite scroll, some social networks) is missing from the capture.
 
-Limits: responses larger than `WARC_STUDIO_MAX_RESOURCE_MB` are skipped, at most 3000 resources and
-10000 pages per capture, optional time limit per capture.
+Limits: responses larger than `WARC_STUDIO_MAX_RESOURCE_MB` are skipped. Buffered raw responses
+across concurrent crawls share `WARC_STUDIO_MAX_BUFFER_MB`; the crawler skips a response when
+that budget is exhausted. Each capture allows at most 3000 resources and 10000 pages, with an
+optional time limit. Decoded HTML, temporary WARC compression buffers, and uploads use additional memory.
 
 ---
 
@@ -79,7 +81,7 @@ Limits: responses larger than `WARC_STUDIO_MAX_RESOURCE_MB` are skipped, at most
 - CMake 3.26+
 - SQLite3, OpenSSL, zlib and libcurl development headers
   (`libsqlite3-dev libssl-dev zlib1g-dev libcurl4-openssl-dev`)
-- `unzip` (reads page metadata from uploaded WACZ files)
+- `unzip` (inspects uploaded WACZ files with bounded metadata reads)
 - Python 3.9+ for the backup/restore tool and integration test
 
 ---
@@ -110,11 +112,13 @@ Then open [http://localhost:18080/](http://localhost:18080/). The server listens
 |---------------------------------|------------------------------------------|-------------|
 | `WARC_STUDIO_DATA_DIR`          | `data`                                   | SQLite DB, archives, crawl output and logs |
 | `WARC_STUDIO_PORT`              | `18080`                                  | HTTP port |
+| `WARC_STUDIO_REPLAY_PORT`       | main port + 1                           | Read-only replay origin on `127.0.0.1` |
 | `WARC_STUDIO_MAX_REQUEST_MB`    | `128`                                    | Maximum HTTP request body, including uploaded archives; larger requests receive 413 |
 | `WARC_STUDIO_MAX_CONCURRENT_UPLOADS` | `2`                               | Uploads accepted at once; extra uploads receive 503 and may be retried |
 | `WARC_STUDIO_CRAWL_WORKERS`     | `2`                                      | Number of captures crawled in parallel |
 | `WARC_STUDIO_CRAWL_TIME_LIMIT`  | `0`                                      | Time limit per capture in seconds, `0` = none |
 | `WARC_STUDIO_MAX_RESOURCE_MB`   | `100`                                    | Larger responses are skipped |
+| `WARC_STUDIO_MAX_BUFFER_MB`     | `256`                                    | Shared budget for buffered raw crawler responses |
 | `WARC_STUDIO_USER_AGENT`        | Chrome on Linux + `warc-studio/0.4`      | User-Agent sent by the crawler |
 | `WARC_STUDIO_STATIC_DIR`        | `static/` next to the executable         | Static assets directory |
 
@@ -173,21 +177,25 @@ GET  /capture/<id>/download     Download the archive file
 GET  /tags, POST /tags/rename, POST /tags/delete
 GET  /upload, POST /upload      Upload own WARC/WACZ (file, url, tags, title, timestamp, note)
 GET  /about                     Settings, statistics, bookmarklet
-GET  /archives/<path>           Archive files for locally hosted ReplayWeb.page (Range support)
-GET  /replay/ui.js, /replay/sw.js, /replay/...   ReplayWeb.page (self-hosted)
 GET  /health
+
+Read-only replay port:
+GET  /capture/<id>/replay       Replay page after redirect from the main app
+GET  /archives/<path>           Archive bytes (Range support)
+GET  /replay/ui.js, /replay/sw.js, /replay/...   ReplayWeb.page assets and shell
 ```
 
 ---
 
 ## Replay troubleshooting
 
-ReplayWeb.page (`ui.js`, `sw.js`, vendored from replaywebpage@2.4.6) is served locally under `/replay/`,
-so archives and player share one origin and there is no mixed-content problem.
+ReplayWeb.page (`ui.js`, `sw.js`, vendored from replaywebpage@2.4.6) runs on the separate
+read-only replay port. Its archive files and player share that origin. Archived scripts cannot
+access the main application's pages or mutation routes.
 
 If a replay shows "No Results Found":
 
 1. Check the file downloads: `curl -o /tmp/test.wacz http://localhost:18080/capture/<id>/download`
-2. Check Range support: `curl -I -H "Range: bytes=0-1023" http://localhost:18080/archives/<path>` — expect `206` with `Content-Range`.
+2. Check Range support: `curl -I -H "Range: bytes=0-1023" http://127.0.0.1:18081/archives/<path>` — expect `206` with `Content-Range`.
 3. Clear a stale service worker: DevTools → Application → Service Workers → Unregister, then hard refresh.
 4. Try a private window.

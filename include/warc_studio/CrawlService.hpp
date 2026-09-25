@@ -22,6 +22,7 @@ struct CrawlConfig {
     int workers{2};                     // number of crawls running in parallel
     int timeLimitSeconds{0};            // per crawl, 0 = none
     std::int64_t maxResourceBytes{};    // larger responses are skipped
+    std::int64_t maxBufferedBytes{};    // shared raw response budget across crawls
 };
 
 // Runs queued captures in background worker threads with the built-in crawler (see Crawler.hpp).

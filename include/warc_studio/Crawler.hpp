@@ -18,6 +18,7 @@ struct CrawlOptions {
     std::string userAgent;
     int timeLimitSeconds{0};              // whole crawl, 0 = no limit
     std::int64_t maxResourceBytes{100LL * 1024 * 1024};  // larger responses are skipped
+    std::int64_t maxBufferedBytes{256LL * 1024 * 1024};  // shared raw response budget across crawls
     int maxResources{3000};               // fetched URLs per crawl (pages excluded)
 };
 

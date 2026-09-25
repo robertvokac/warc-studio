@@ -75,15 +75,21 @@ def validate_database(root: Path):
     with contextlib.closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as db:
         if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("SQLite integrity check failed")
-        for (stored,) in db.execute(
-            "SELECT file_path FROM capture WHERE status = 'archived' AND file_path IS NOT NULL"
+        if db.execute("PRAGMA foreign_key_check").fetchone():
+            raise RuntimeError("SQLite foreign key check failed")
+        for stored, expected_sha in db.execute(
+            "SELECT file_path, sha256 FROM capture WHERE status = 'archived'"
         ):
+            if not stored:
+                raise RuntimeError("Archived capture has no archive file path")
             relative = Path(stored)
             if relative.is_absolute() or relative.parts[:1] != ("archives",) or ".." in relative.parts:
                 raise RuntimeError(f"Unsafe archive path in database: {stored}")
             archive = root / relative
             if not archive.is_file() or archive.is_symlink():
                 raise RuntimeError(f"Archived capture file is missing: {stored}")
+            if expected_sha and digest(archive).lower() != expected_sha.lower():
+                raise RuntimeError(f"Archived capture checksum differs from database: {stored}")
 
 
 def manifest_for(root: Path):

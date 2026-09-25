@@ -96,6 +96,7 @@ void CrawlService::runCapture(const Capture& capture, const std::atomic<bool>& s
         .userAgent = config_.userAgent,
         .timeLimitSeconds = config_.timeLimitSeconds,
         .maxResourceBytes = config_.maxResourceBytes,
+        .maxBufferedBytes = config_.maxBufferedBytes,
     };
 
     CrawlResult result;

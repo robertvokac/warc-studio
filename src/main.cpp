@@ -42,8 +42,7 @@ static constexpr const char* kDefaultUserAgent =
     "warc-studio/0.4";
 
 // ---------------------------------------------------------------------------
-// ReplayWeb.page is hosted on this same origin. Reject cross-origin mutations
-// and DNS-rebinding hostnames, and expose byte ranges without cross-origin CORS.
+// Reject cross-origin mutations and DNS-rebinding hostnames.
 // ---------------------------------------------------------------------------
 struct LocalAccessMw {
     struct context {};
@@ -70,15 +69,59 @@ struct LocalAccessMw {
         }
     }
 
-    void after_handle(crow::request& req, crow::response& res, context& /*ctx*/) {
-        // ReplayWeb.page runs on this origin; only range capability is needed.
-        if (req.url.rfind("/archives/", 0) == 0 || req.url == "/archives") {
-            res.add_header("Accept-Ranges", "bytes");
+    void after_handle(crow::request&, crow::response&, context&) {}
+};
+
+// Archived pages execute only on this second, read-only origin.
+struct ReplayAccessMw {
+    struct context {};
+    void before_handle(crow::request& req, crow::response& res, context&) {
+        auto host = req.get_header_value("Host");
+        std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) { return std::tolower(c); });
+        if ((host != "127.0.0.1" && !host.starts_with("127.0.0.1:"))
+            || (req.method != crow::HTTPMethod::GET && req.method != crow::HTTPMethod::Head
+                && req.method != crow::HTTPMethod::OPTIONS)) {
+            res = crow::response(403, "Read-only replay origin");
+            res.end();
         }
+    }
+    void after_handle(crow::request& req, crow::response& res, context&) {
+        if (req.url.starts_with("/archives/")) res.add_header("Accept-Ranges", "bytes");
+        res.add_header("X-Content-Type-Options", "nosniff");
     }
 };
 
 namespace {
+
+void recoverStagedDeletes(const warc_studio::FileService& files, warc_studio::Database& database) {
+    constexpr std::string_view marker = ".pending-delete-";
+    std::vector<std::filesystem::path> stagedFiles;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(files.archivesRoot())) {
+        if (entry.is_regular_file() && entry.path().filename().string().find(marker) != std::string::npos) {
+            stagedFiles.push_back(entry.path());
+        }
+    }
+    for (const auto& staged : stagedFiles) {
+        const auto name = staged.filename().string();
+        const auto pos = name.rfind(marker);
+        if (pos == std::string::npos) continue;
+        const auto idText = name.substr(pos + marker.size());
+        if (idText.empty() || !std::all_of(idText.begin(), idText.end(), [](unsigned char c) { return std::isdigit(c); })) continue;
+        int id;
+        try { id = std::stoi(idText); } catch (const std::exception&) { continue; }
+        const auto original = staged.parent_path() / name.substr(0, pos);
+        const auto capture = database.getCapture(id);
+        if (capture && capture->filePath
+            && files.absoluteArchivePath(*capture->filePath) == original) {
+            if (std::filesystem::exists(original)) {
+                throw std::runtime_error("Cannot recover staged archive; target already exists: " + original.string());
+            }
+            std::filesystem::rename(staged, original);
+        } else if (!capture) {
+            std::filesystem::remove(staged);
+        }
+    }
+}
 
 // Shared with tools/backup.py. A backup or restore must never race with a
 // running crawler, upload, or database write.
@@ -277,6 +320,13 @@ std::optional<std::string> optionalFormField(const FormFields& form, const std::
 // Normalizes a user supplied URL and rejects anything that is not http(s).
 std::string requireHttpUrl(const std::string& input) {
     const std::string url = warc_studio::normalizeInputUrl(input);
+    for (std::size_t i = 0; i < url.size(); ++i) {
+        if (url[i] == '%' && (i + 2 >= url.size()
+            || !std::isxdigit(static_cast<unsigned char>(url[i + 1]))
+            || !std::isxdigit(static_cast<unsigned char>(url[i + 2])))) {
+            throw std::runtime_error("Invalid percent encoding in URL: " + input);
+        }
+    }
     if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
         throw std::runtime_error("Only http:// and https:// URLs can be archived: " + input);
     }
@@ -386,7 +436,15 @@ crow::response serveStaticFile(const std::string& relativePath,
 int main() {
     try {
         const auto dataRoot = environmentPathOrDefault("WARC_STUDIO_DATA_DIR", "data");
-        const auto port = static_cast<std::uint16_t>(environmentIntOrDefault("WARC_STUDIO_PORT", 18080));
+        const int configuredPort = environmentIntOrDefault("WARC_STUDIO_PORT", 18080);
+        const int configuredReplayPort = environmentIntOrDefault("WARC_STUDIO_REPLAY_PORT",
+            configuredPort > 0 && configuredPort < 65535 ? configuredPort + 1 : 0);
+        if (configuredPort < 1 || configuredPort > 65535 || configuredReplayPort < 1
+            || configuredReplayPort > 65535 || configuredReplayPort == configuredPort) {
+            throw std::runtime_error("Invalid application or replay port");
+        }
+        const auto port = static_cast<std::uint16_t>(configuredPort);
+        const auto replayPort = static_cast<std::uint16_t>(configuredReplayPort);
         const int maxRequestMb = environmentIntOrDefault("WARC_STUDIO_MAX_REQUEST_MB", 128);
         if (maxRequestMb < 1 || maxRequestMb > 1024) {
             throw std::runtime_error("WARC_STUDIO_MAX_REQUEST_MB must be between 1 and 1024");
@@ -402,7 +460,11 @@ int main() {
             .workers = environmentIntOrDefault("WARC_STUDIO_CRAWL_WORKERS", 2),
             .timeLimitSeconds = environmentIntOrDefault("WARC_STUDIO_CRAWL_TIME_LIMIT", 0),
             .maxResourceBytes = std::int64_t{environmentIntOrDefault("WARC_STUDIO_MAX_RESOURCE_MB", 100)} * 1024 * 1024,
+            .maxBufferedBytes = std::int64_t{environmentIntOrDefault("WARC_STUDIO_MAX_BUFFER_MB", 256)} * 1024 * 1024,
         };
+        if (crawlConfig.maxResourceBytes < 1 || crawlConfig.maxBufferedBytes < 1) {
+            throw std::runtime_error("Crawler size limits must be positive");
+        }
         // libcurl must be initialized before any thread uses it.
         curl_global_init(CURL_GLOBAL_DEFAULT);
 
@@ -413,28 +475,13 @@ int main() {
         DataLock dataLock(dataRoot);
         warc_studio::Database database(dataRoot / "warc-studio.sqlite3");
         warc_studio::FileService fileService(dataRoot);
+        recoverStagedDeletes(fileService, database);
         warc_studio::CrawlService crawler(database, fileService, crawlConfig);
         crawler.start();
 
         crow::App<LocalAccessMw> app;
 
-        // -----------------------------------------------------------------------
-        // Static assets
-        // -----------------------------------------------------------------------
-
-        // Note: Crow 1.2.0 does not support two GET routes with <path> at the same depth,
-        // so we cannot use /static/<path> alongside /archives/<path>. Use explicit routes instead.
-        CROW_ROUTE(app, "/favicon.svg")(
-            [&staticRoot]() {
-                return serveStaticFile("favicon.svg", "image/svg+xml", staticRoot);
-            }
-        );
-
-        CROW_ROUTE(app, "/static/style.css")(
-            [&staticRoot]() {
-                return serveStaticFile("style.css", "text/css; charset=utf-8", staticRoot);
-            }
-        );
+        crow::App<ReplayAccessMw> replayApp;
 
         // ReplayWeb.page assets — served locally from static/ so that both
         // the JS bundle and the WACZ fetches originate from the same HTTP origin,
@@ -445,18 +492,15 @@ int main() {
         //   /replay/ui.js  — primary path; replayBase="/replay/" causes the
         //                    web component to compute this URL automatically.
         //   /replay/sw.js  — service worker with scope /replay/.
-        //   /static/ui.js  — alternate path kept for backward compatibility.
-        //   /static/sw.js  — alternate path kept for backward compatibility.
-        //   /sw.js         — root-scope SW kept for any old cached registrations.
-        for (const char* route : {"/replay/ui.js", "/static/ui.js"}) {
-            app.route_dynamic(route)([&staticRoot]() {
+        for (const char* route : {"/replay/ui.js"}) {
+            replayApp.route_dynamic(route)([&staticRoot]() {
                 auto res = serveStaticFile("ui.js", "application/javascript; charset=utf-8", staticRoot);
                 res.add_header("Cache-Control", "no-store");
                 return res;
             });
         }
-        for (const char* route : {"/replay/sw.js", "/static/sw.js", "/sw.js"}) {
-            app.route_dynamic(route)([&staticRoot]() {
+        for (const char* route : {"/replay/sw.js"}) {
+            replayApp.route_dynamic(route)([&staticRoot]() {
                 auto res = serveStaticFile("sw.js", "application/javascript; charset=utf-8", staticRoot);
                 res.add_header("Cache-Control", "no-store");
                 return res;
@@ -477,15 +521,32 @@ int main() {
             return res;
         };
         // Crow treats /replay and /replay/ as the same route — register only one.
-        CROW_ROUTE(app, "/replay/")(replayShellHandler);
+        CROW_ROUTE(replayApp, "/replay/")(replayShellHandler);
 
         // Catch-all for /replay/<path> sub-paths (e.g. /replay/w/<ts>/<url>).
         // ReplayWeb.page uses internal navigation paths under /replay/ that are
         // normally intercepted by the service worker. On first load (before the SW
         // is installed/active), these requests fall through to the server.
         // Returning the shell HTML allows the SW to register and take over.
-        CROW_ROUTE(app, "/replay/<path>")(
+        CROW_ROUTE(replayApp, "/replay/<path>")(
             [replayShellHandler](const std::string& /*subPath*/) { return replayShellHandler(); }
+        );
+
+        // -----------------------------------------------------------------------
+        // Static assets
+        // -----------------------------------------------------------------------
+
+        // Only the UI's own assets are exposed on the main origin.
+        CROW_ROUTE(app, "/favicon.svg")(
+            [&staticRoot]() {
+                return serveStaticFile("favicon.svg", "image/svg+xml", staticRoot);
+            }
+        );
+
+        CROW_ROUTE(app, "/static/style.css")(
+            [&staticRoot]() {
+                return serveStaticFile("style.css", "text/css; charset=utf-8", staticRoot);
+            }
         );
 
         CROW_ROUTE(app, "/health")([] {
@@ -767,10 +828,24 @@ int main() {
                     return redirectWithMessage(captureHref(id), "Error: stop the crawl before deleting the capture.");
                 }
                 try {
-                    fileService.deleteStoredArchiveIfPresent(capture->filePath);
+                    std::filesystem::path archive;
+                    std::filesystem::path staged;
+                    if (capture->filePath) {
+                        archive = fileService.absoluteArchivePath(*capture->filePath);
+                        if (std::filesystem::exists(archive)) {
+                            staged = archive.string() + ".pending-delete-" + std::to_string(id);
+                            std::filesystem::rename(archive, staged);
+                        }
+                    }
+                    try {
+                        database.deleteCapture(id);
+                    } catch (...) {
+                        if (!staged.empty()) std::filesystem::rename(staged, archive);
+                        throw;
+                    }
+                    if (!staged.empty()) std::filesystem::remove(staged);
                     std::error_code ec;
                     std::filesystem::remove(crawler.logPath(id), ec);
-                    database.deleteCapture(id);
                     return redirectWithMessage(urlHistoryHref(capture->url), "Capture was deleted.");
                 } catch (const std::exception& error) {
                     return redirectWithMessage(captureHref(id), std::string("Error: ") + error.what());
@@ -779,16 +854,25 @@ int main() {
         );
 
         CROW_ROUTE(app, "/capture/<int>/replay")(
-            [&database, &fileService](int id) {
+            [&database, replayPort](int id) {
                 const auto capture = database.getCapture(id);
-                if (!capture) {
-                    return crow::response(404, "Capture not found");
-                }
+                if (!capture) return crow::response(404, "Capture not found");
                 if (capture->status != "archived" || !capture->filePath) {
                     return redirectWithMessage(captureHref(id), "This capture has no archive file to replay yet.");
                 }
+                return redirectTo("http://127.0.0.1:" + std::to_string(replayPort) + captureHref(id) + "/replay");
+            }
+        );
+
+        CROW_ROUTE(replayApp, "/capture/<int>/replay")(
+            [&database, &fileService, port](int id) {
+                const auto capture = database.getCapture(id);
+                if (!capture || capture->status != "archived" || !capture->filePath) {
+                    return crow::response(404, "Archive file not found");
+                }
                 return htmlResponse(warc_studio::renderReplayPage(
-                    *capture, fileService.publicArchivePath(*capture->filePath)));
+                    *capture, fileService.publicArchivePath(*capture->filePath),
+                    "http://127.0.0.1:" + std::to_string(port)));
             }
         );
 
@@ -874,6 +958,9 @@ int main() {
                     storedPath = stored.storedPath;
 
                     const auto info = fileService.inspectArchive(stored.storedPath);
+                    if (info.url.empty()) {
+                        throw std::runtime_error("The file is not a readable WARC or WACZ archive.");
+                    }
                     std::string url = field("url");
                     if (url.empty()) url = info.url;
                     if (url.empty()) {
@@ -936,19 +1023,19 @@ int main() {
         // Archive file serving for the locally hosted ReplayWeb.page
         // -----------------------------------------------------------------------
 
-        CROW_ROUTE(app, "/archives/<path>").methods(crow::HTTPMethod::OPTIONS)(
+        CROW_ROUTE(replayApp, "/archives/<path>").methods(crow::HTTPMethod::OPTIONS)(
             [&fileService](const crow::request&, const std::string&) {
                 return fileService.archiveOptionsResponse();
             }
         );
 
-        CROW_ROUTE(app, "/archives/<path>").methods(crow::HTTPMethod::Head)(
+        CROW_ROUTE(replayApp, "/archives/<path>").methods(crow::HTTPMethod::Head)(
             [&fileService](const crow::request& request, const std::string& path) {
                 return fileService.serveArchive(request, path);
             }
         );
 
-        CROW_ROUTE(app, "/archives/<path>")(
+        CROW_ROUTE(replayApp, "/archives/<path>")(
             [&fileService](const crow::request& request, const std::string& path) {
                 return fileService.serveArchive(request, path);
             }
@@ -958,7 +1045,22 @@ int main() {
         std::cout << "Data directory: " << fileService.dataRoot() << "\n";
         std::cout << "Static files: " << staticRoot << "\n";
         app.loglevel(crow::LogLevel::Warning);
-        app.bindaddr("127.0.0.1").port(port).multithreaded().run();
+        replayApp.loglevel(crow::LogLevel::Warning);
+        replayApp.bindaddr("127.0.0.1").port(replayPort).multithreaded();
+        auto replayFuture = replayApp.run_async();
+        if (replayFuture.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready) {
+            replayFuture.get();
+            throw std::runtime_error("Replay server stopped during startup");
+        }
+        try {
+            app.bindaddr("127.0.0.1").port(port).multithreaded().run();
+        } catch (...) {
+            replayApp.stop();
+            replayFuture.get();
+            throw;
+        }
+        replayApp.stop();
+        replayFuture.get();
 
     } catch (const std::exception& error) {
         std::cerr << "Fatal error: " << error.what() << '\n';

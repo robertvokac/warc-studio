@@ -145,6 +145,7 @@ target_include_directories(warc-studio
 target_compile_definitions(warc-studio
     PRIVATE
         ASIO_STANDALONE   # Use standalone Asio (not Boost.Asio)
+        CROW_DISABLE_STATIC_DIR  # Only explicitly registered paths are served on each origin
         # Do NOT define CROW_USE_BOOST — Crow uses standalone Asio when the macro is absent
 )
 

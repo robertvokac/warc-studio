@@ -53,7 +53,8 @@ std::string renderTagsPage(const std::vector<TagCount>& tags, const std::optiona
 std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::optional<std::string>& message);
 
 // Page: replay a capture with ReplayWeb.page (/capture/<id>/replay)
-std::string renderReplayPage(const Capture& capture, const std::string& archiveSource);
+std::string renderReplayPage(const Capture& capture, const std::string& archiveSource,
+                             const std::string& mainOrigin);
 
 // Page: settings / about (/about)
 struct AboutView {

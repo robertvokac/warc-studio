@@ -51,10 +51,14 @@ std::string urlDecode(std::string_view value) {
             continue;
         }
 
-        if (ch == '%' && i + 2 < value.size()) {
-            const auto hex = std::string(value.substr(i + 1, 2));
-            const auto decoded = static_cast<char>(std::stoi(hex, nullptr, 16));
-            out.push_back(decoded);
+        if (ch == '%') {
+            if (i + 2 >= value.size() || !std::isxdigit(static_cast<unsigned char>(value[i + 1]))
+                || !std::isxdigit(static_cast<unsigned char>(value[i + 2]))) {
+                out.push_back('%');
+                continue;
+            }
+            const auto digit = [](char c) { return c <= '9' ? c - '0' : (c & ~0x20) - 'A' + 10; };
+            out.push_back(static_cast<char>(digit(value[i + 1]) * 16 + digit(value[i + 2])));
             i += 2;
             continue;
         }

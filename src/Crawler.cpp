@@ -33,6 +33,24 @@ constexpr int kMaxFrameDepth = 2;
 constexpr int kHardPageLimit = 10000;
 constexpr int kParallelFetches = 6;  // like a browser's connections per host
 
+std::atomic<std::size_t> bufferedResponseBytes{0};
+
+struct BufferLease {
+    std::size_t bytes{};
+    ~BufferLease() { bufferedResponseBytes.fetch_sub(bytes, std::memory_order_relaxed); }
+    bool reserve(std::size_t amount, std::size_t limit) {
+        auto current = bufferedResponseBytes.load(std::memory_order_relaxed);
+        while (true) {
+            if (current > limit || amount > limit - current) return false;
+            if (bufferedResponseBytes.compare_exchange_weak(current, current + amount,
+                    std::memory_order_acq_rel)) {
+                bytes += amount;
+                return true;
+            }
+        }
+    }
+};
+
 std::string toLower(std::string_view value) {
     std::string out(value);
     std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -112,6 +130,7 @@ std::optional<std::string> inflateBody(std::string_view data) {
 }
 
 struct Exchange {
+    std::unique_ptr<BufferLease> lease{std::make_unique<BufferLease>()};
     bool ok{};                 // a complete HTTP response was received
     std::string error;
     std::string request;       // raw request header block as sent
@@ -164,6 +183,7 @@ public:
         Exchange exchange;
         current_ = &exchange;
         tooLarge_ = false;
+        bufferFull_ = false;
 
         curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, (std::string("Accept: ") + accept).c_str());
@@ -210,6 +230,8 @@ public:
             exchange.ok = true;
         } else if (tooLarge_) {
             exchange.error = "larger than " + formatSize(static_cast<std::size_t>(options_.maxResourceBytes)) + ", skipped";
+        } else if (bufferFull_) {
+            exchange.error = "shared response buffer limit reached, skipped";
         } else if (code == CURLE_ABORTED_BY_CALLBACK) {
             exchange.error = stop_ ? "stopped" : "time limit reached";
         } else {
@@ -225,6 +247,7 @@ private:
     CURL* curl_;
     Exchange* current_{};
     bool tooLarge_{};
+    bool bufferFull_{};
 
     static std::size_t onHeader(char* data, std::size_t size, std::size_t count, void* self) {
         auto& fetcher = *static_cast<Fetcher*>(self);
@@ -242,6 +265,11 @@ private:
         if (static_cast<std::int64_t>(body.size() + size * count) > fetcher.options_.maxResourceBytes) {
             fetcher.tooLarge_ = true;
             return 0;  // aborts the transfer
+        }
+        if (!fetcher.current_->lease->reserve(size * count,
+                static_cast<std::size_t>(fetcher.options_.maxBufferedBytes))) {
+            fetcher.bufferFull_ = true;
+            return 0;
         }
         body.append(data, size * count);
         return size * count;

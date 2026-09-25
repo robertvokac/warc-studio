@@ -699,10 +699,17 @@ void Database::updateCaptureDetails(int id, const std::string& url, const std::o
 
 void Database::deleteCapture(int id) {
     std::lock_guard lock(mutex_);
-    Statement stmt(db_, "DELETE FROM capture WHERE id = ?;");
-    stmt.bindInt(1, id);
-    stepDone(db_, stmt);
-    deleteUnusedTags();
+    execute("BEGIN;");
+    try {
+        Statement stmt(db_, "DELETE FROM capture WHERE id = ?;");
+        stmt.bindInt(1, id);
+        stepDone(db_, stmt);
+        deleteUnusedTags();
+        execute("COMMIT;");
+    } catch (...) {
+        execute("ROLLBACK;");
+        throw;
+    }
 }
 
 // ---------------------------------------------------------------------------

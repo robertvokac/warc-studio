@@ -132,12 +132,14 @@ ArchiveInfo inspectWarc(const std::filesystem::path& path) {
         if (info.timestamp.empty() && !date.empty()) {
             info.timestamp = parseTimestamp(date);
         }
-        if (type == "response" && startsWith(targetUri, "http")) {
-            info.url = targetUri;
-            info.timestamp = parseTimestamp(date);
+        if (type == "response" && (startsWith(targetUri, "http://") || startsWith(targetUri, "https://"))
+            && contentLength > 0) {
             std::string content(static_cast<std::size_t>(std::min<long long>(contentLength, 256 * 1024)), '\0');
             const int read = gzread(file, content.data(), static_cast<unsigned>(content.size()));
             content.resize(read > 0 ? static_cast<std::size_t>(read) : 0);
+            if (!startsWith(content, "HTTP/")) break;
+            info.url = targetUri;
+            info.timestamp = parseTimestamp(date);
             info.title = extractHtmlTitle(content);
             break;
         }
@@ -149,25 +151,80 @@ ArchiveInfo inspectWarc(const std::filesystem::path& path) {
     return info;
 }
 
-// Reads pages/pages.jsonl from a WACZ (via unzip) and returns the first page.
+// Read at most maxBytes of command output. A metadata ZIP bomb must not grow memory
+// without bound; closing the pipe also stops unzip rather than draining the entry.
+std::string boundedCommandOutput(const std::string& command, std::size_t maxBytes) {
+    FILE* pipe = ::popen(command.c_str(), "r");
+    if (!pipe) return {};
+    std::string output;
+    char buf[4096];
+    while (output.size() <= maxBytes) {
+        const auto count = std::fread(buf, 1, std::min(sizeof(buf), maxBytes + 1 - output.size()), pipe);
+        if (count == 0) break;
+        output.append(buf, count);
+    }
+    const bool tooLarge = output.size() > maxBytes;
+    const int status = ::pclose(pipe);
+    return tooLarge || status != 0 ? std::string() : output;
+}
+
+std::string commandPrefix(const std::string& command, std::size_t bytes) {
+    FILE* pipe = ::popen(command.c_str(), "r");
+    if (!pipe) return {};
+    std::string prefix(bytes, '\0');
+    const auto count = std::fread(prefix.data(), 1, bytes, pipe);
+    prefix.resize(count);
+    ::pclose(pipe);  // an early close deliberately stops decompression
+    return prefix;
+}
+
+// Reads bounded metadata from a WACZ and requires its essential members.
 ArchiveInfo inspectWacz(const std::filesystem::path& path) {
     ArchiveInfo info;
-    const std::string command = "unzip -p " + shellQuote(path.string()) + " pages/pages.jsonl 2>/dev/null";
-    FILE* pipe = ::popen(command.c_str(), "r");
-    if (pipe == nullptr) {
+    const auto quoted = shellQuote(path.string());
+    const auto listing = boundedCommandOutput("unzip -Z -1 " + quoted + " 2>/dev/null", 1024 * 1024);
+    bool manifest = false, pages = false;
+    std::string archiveEntry, indexEntry;
+    std::istringstream entries(listing);
+    for (std::string entry; std::getline(entries, entry);) {
+        manifest |= entry == "datapackage.json";
+        pages |= entry == "pages/pages.jsonl";
+        if (archiveEntry.empty() && startsWith(entry, "archive/") &&
+            (entry.ends_with(".warc") || entry.ends_with(".warc.gz"))) archiveEntry = entry;
+        if (indexEntry.empty() && startsWith(entry, "indexes/") &&
+            (entry.ends_with(".cdx") || entry.ends_with(".cdx.gz")
+             || entry.ends_with(".cdxj") || entry.ends_with(".cdxj.gz"))) indexEntry = entry;
+    }
+    if (!manifest || !pages || archiveEntry.empty() || indexEntry.empty()) return info;
+    const auto manifestJson = boundedCommandOutput("unzip -p " + quoted + " datapackage.json 2>/dev/null", 1024 * 1024);
+    const auto manifestData = crow::json::load(manifestJson);
+    if (!manifestData || manifestData.t() != crow::json::type::Object
+        || !manifestData.has("resources") || manifestData["resources"].t() != crow::json::type::List) return info;
+    bool listedPages = false, listedArchive = false, listedIndex = false;
+    for (const auto& resource : manifestData["resources"]) {
+        if (resource.t() != crow::json::type::Object || !resource.has("path")
+            || resource["path"].t() != crow::json::type::String) continue;
+        const auto entry = std::string(resource["path"].s());
+        listedPages |= entry == "pages/pages.jsonl";
+        listedArchive |= entry == archiveEntry;
+        listedIndex |= entry == indexEntry;
+    }
+    if (!listedPages || !listedArchive || !listedIndex) return info;
+    const auto prefix = commandPrefix("unzip -p " + quoted + " " + shellQuote(archiveEntry) + " 2>/dev/null", 8);
+    if (prefix.size() != 8 || (archiveEntry.ends_with(".gz")
+        ? !startsWith(prefix, "\x1f\x8b") : !startsWith(prefix, "WARC/"))) {
         return info;
     }
+    const auto content = boundedCommandOutput("unzip -p " + quoted + " pages/pages.jsonl 2>/dev/null", 1024 * 1024);
+    std::istringstream lines(content);
     std::string line;
-    char buf[4096];
-    int lines = 0;
-    while (lines < 20 && std::fgets(buf, sizeof(buf), pipe) != nullptr) {
-        line += buf;
-        if (line.empty() || line.back() != '\n') continue;
-        ++lines;
+    for (int count = 0; count < 20 && std::getline(lines, line); ++count) {
+        if (line.size() > 256 * 1024) return {};
         const auto json = crow::json::load(line);
-        line.clear();
         if (!json || json.t() != crow::json::type::Object || !json.has("url")) continue;
-        info.url = std::string(json["url"].s());
+        const auto url = std::string(json["url"].s());
+        if (!startsWith(url, "http://") && !startsWith(url, "https://")) continue;
+        info.url = url;
         if (json.has("ts") && json["ts"].t() == crow::json::type::String) {
             info.timestamp = parseTimestamp(std::string(json["ts"].s()));
         }
@@ -176,9 +233,6 @@ ArchiveInfo inspectWacz(const std::filesystem::path& path) {
         }
         break;
     }
-    // Drain so unzip does not die of SIGPIPE while we pclose.
-    while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {}
-    ::pclose(pipe);
     return info;
 }
 
@@ -453,8 +507,7 @@ void FileService::deleteStoredArchiveIfPresent(const std::optional<std::string>&
         return;
     }
     const auto path = absoluteArchivePath(*storedPath);
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path);
 }
 
 } // namespace warc_studio

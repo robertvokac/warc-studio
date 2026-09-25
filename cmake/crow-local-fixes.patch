@@ -104,6 +104,95 @@ index fffbffb..639c9ea 100644
      private:
          bool completed_{};
          std::function<void()> complete_request_handler_;
+diff --git a/include/crow/multipart.h b/include/crow/multipart.h
+index f7b6c24..065b243 100644
+--- a/include/crow/multipart.h
++++ b/include/crow/multipart.h
+@@ -134,9 +134,9 @@ namespace crow
+                     content_type = "multipart/form-data; boundary=" + boundary;
+                 for (auto& item : parts)
+                 {
+-                    part_map.emplace(
+-                      (get_header_object(item.headers, "Content-Disposition").params.find("name")->second),
+-                      item);
++                    const auto& params = get_header_object(item.headers, "Content-Disposition").params;
++                    const auto name = params.find("name");
++                    if (name != params.end()) part_map.emplace(name->second, item);
+                 }
+             }
+ 
+@@ -159,7 +159,7 @@ namespace crow
+                 if (found != std::string::npos)
+                 {
+                     std::string to_return(header.substr(found + strlen(boundary_text)));
+-                    if (to_return[0] == '\"')
++                    if (to_return.size() >= 2 && to_return[0] == '\"')
+                     {
+                         to_return = to_return.substr(1, to_return.length() - 2);
+                     }
+@@ -171,6 +171,7 @@ namespace crow
+             void parse_body(std::string body, std::vector<part>& sections, mp_map& part_map)
+             {
+ 
++                if (boundary.empty()) return;
+                 std::string delimiter = dd + boundary;
+ 
+                 // TODO(EDev): Exit on error
+@@ -190,10 +191,12 @@ namespace crow
+                     if (!section.empty())
+                     {
+                         part parsed_section(parse_section(section));
+-                        part_map.emplace(
+-                          (get_header_object(parsed_section.headers, "Content-Disposition").params.find("name")->second),
+-                          parsed_section);
+-                        sections.push_back(std::move(parsed_section));
++                        const auto& params = get_header_object(parsed_section.headers, "Content-Disposition").params;
++                        const auto name = params.find("name");
++                        if (name != params.end()) {
++                            part_map.emplace(name->second, parsed_section);
++                            sections.push_back(std::move(parsed_section));
++                        }
+                     }
+                 }
+             }
+@@ -203,11 +206,12 @@ namespace crow
+                 struct part to_return;
+ 
+                 size_t found = section.find(crlf + crlf);
++                if (found == std::string::npos || section.size() < found + 4) return to_return;
+                 std::string head_line = section.substr(0, found + 2);
+                 section.erase(0, found + 4);
+ 
+                 parse_section_head(head_line, to_return);
+-                to_return.body = section.substr(0, section.length() - 2);
++                to_return.body = section.size() >= 2 ? section.substr(0, section.length() - 2) : std::string();
+                 return to_return;
+             }
+ 
+@@ -218,6 +222,7 @@ namespace crow
+                     header to_add;
+ 
+                     size_t found = lines.find(crlf);
++                    if (found == std::string::npos) break;
+                     std::string line = lines.substr(0, found);
+                     std::string key;
+                     lines.erase(0, found + 2);
+@@ -234,6 +239,7 @@ namespace crow
+                         size_t header_split = header.find(": ");
+                         key = header.substr(0, header_split);
+ 
++                        if (header_split == std::string::npos) continue;
+                         to_add.value = header.substr(header_split + 2);
+                     }
+ 
+@@ -249,6 +255,7 @@ namespace crow
+ 
+                         size_t param_split = param.find('=');
+ 
++                        if (param_split == std::string::npos) continue;
+                         std::string value = param.substr(param_split + 1);
+ 
+                         to_add.params.emplace(param.substr(0, param_split), trim(value));
 diff --git a/include/crow/parser.h b/include/crow/parser.h
 index 7099e8c..9fc0ea2 100644
 --- a/include/crow/parser.h

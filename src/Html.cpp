@@ -724,12 +724,12 @@ std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::op
 // Replay
 // ---------------------------------------------------------------------------
 
-std::string renderReplayPage(const Capture& capture, const std::string& archiveSource) {
+std::string renderReplayPage(const Capture& capture, const std::string& archiveSource,
+                             const std::string& mainOrigin) {
     std::ostringstream html;
     html << "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
          << "<title>Warc Studio | Replay: " << htmlEscape(displayTitle(capture)) << " ("
          << htmlEscape(formatTimestamp(capture.timestamp)) << ")</title>\n"
-         << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n"
          // ui.js is loaded from /replay/ui.js — same path as replayBase so SW registration works.
          << "<script src=\"/replay/ui.js\"></script>\n"
          << "<style>\n"
@@ -741,11 +741,11 @@ std::string renderReplayPage(const Capture& capture, const std::string& archiveS
          << ".replay-bar a{color:#90caf9;text-decoration:none;}\n"
          << ".replay-bar .url{color:#aed6a0;word-break:break-all;}\n"
          << "</style>\n</head>\n<body>\n<div class=\"replay-bar\">\n"
-         << "<a href=\"/capture/" << capture.id << "\">&larr; Capture</a>\n"
+         << "<a href=\"" << htmlEscape(mainOrigin) << "/capture/" << capture.id << "\">&larr; Capture</a>\n"
          << "<strong>" << htmlEscape(formatTimestamp(capture.timestamp)) << " UTC</strong>\n"
          << "<span class=\"url\">" << htmlEscape(capture.url) << "</span>\n"
-         << "<a href=\"" << htmlEscape(urlHistoryHref(capture.url)) << "\">other captures</a>\n"
-         << "<a href=\"/capture/" << capture.id << "/download\" style=\"margin-left:auto\">&#11015; Download "
+         << "<a href=\"" << htmlEscape(mainOrigin + urlHistoryHref(capture.url)) << "\">other captures</a>\n"
+         << "<a href=\"" << htmlEscape(mainOrigin) << "/capture/" << capture.id << "/download\" style=\"margin-left:auto\">&#11015; Download "
          << htmlEscape(capture.fileType.value_or("")) << "</a>\n</div>\n";
     // <replay-web-page> web component:
     // - source: relative same-origin path to the archive (no mixed content)
