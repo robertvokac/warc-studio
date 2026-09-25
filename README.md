@@ -91,7 +91,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Tests: `ctest --test-dir build --output-on-failure`. The integration test starts a local fixture site and WARC Studio, crawls and uploads a real WARC, checks replay routes and byte ranges, then tests backup and restore. Python 3 is required for this test.
+Tests: `ctest --test-dir build --output-on-failure`. The integration test starts a local fixture site and WARC Studio, crawls and uploads a real WARC, checks replay routes and byte ranges, then tests backup and restore. When Chrome or Chromium is installed, it also checks that ReplayWeb.page renders the archived page in a browser. Python 3 is required for this test.
 
 ## Run
 

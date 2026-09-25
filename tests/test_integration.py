@@ -15,6 +15,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from browser_replay import check_browser_replay
+
 
 APP = Path(sys.argv[1]).resolve()
 BACKUP_TOOL = Path(__file__).resolve().parents[1] / "tools" / "backup.py"
@@ -137,6 +139,7 @@ def run():
             assert headers["Content-Range"].startswith("bytes 0-31/")
             assert request(base + "/replay/ui.js")[0] == 200
             assert request(base + "/replay/sw.js")[0] == 200
+            check_browser_replay(base + f"/capture/{capture_id}/replay", "Archived page", root)
 
             boundary = "warc-studio-test-boundary"
             upload = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
