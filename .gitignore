@@ -53,6 +53,8 @@ core
 *.tmp
 *.bak
 *~
+__pycache__/
+*.pyc
 
 # Output files created by helper tools in this project
 .output.txt

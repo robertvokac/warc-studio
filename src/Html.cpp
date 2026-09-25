@@ -655,7 +655,7 @@ std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::op
     html << "<div class=\"card\">\n<h1>Upload a WARC / WACZ file</h1>\n"
          << "<p class=\"muted\">The file becomes a capture of its own. URL, date and title are read from the file "
          << "when you leave them empty.</p>\n"
-         << "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\" class=\"stack\">\n"
+         << "<form id=\"archive-upload-form\" method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\" class=\"stack\">\n"
          << "<div class=\"form-group\"><label>File (.warc, .warc.gz, .wacz)</label>"
          << "<input type=\"file\" name=\"file\" accept=\".warc,.gz,.wacz\" required></div>\n"
          << "<div class=\"form-group\"><label>URL</label><input type=\"text\" name=\"url\" "
@@ -669,7 +669,53 @@ std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::op
          << "</div>\n"
          << "<div class=\"form-group\"><label>Note</label><textarea name=\"note\" rows=\"2\"></textarea></div>\n"
          << "<div><button type=\"submit\">Upload</button></div>\n"
-         << "</form>\n</div>\n";
+         << "<div id=\"upload-progress-panel\" hidden role=\"status\" aria-live=\"polite\">"
+         << "<progress id=\"upload-progress\" max=\"100\" value=\"0\"></progress> "
+         << "<span id=\"upload-progress-label\">Preparing upload…</span></div>\n"
+         << "</form>\n</div>\n"
+         << R"HTML(<script>
+(() => {
+  const form = document.getElementById('archive-upload-form');
+  const panel = document.getElementById('upload-progress-panel');
+  const bar = document.getElementById('upload-progress');
+  const label = document.getElementById('upload-progress-label');
+  const button = form.querySelector('button[type="submit"]');
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    button.disabled = true;
+    panel.hidden = false;
+    bar.value = 0;
+    label.textContent = 'Starting upload…';
+    const request = new XMLHttpRequest();
+    request.open('POST', form.action);
+    request.upload.onprogress = progress => {
+      if (progress.lengthComputable) {
+        const percent = Math.round(100 * progress.loaded / progress.total);
+        bar.value = percent;
+        label.textContent = percent + '% uploaded';
+      } else {
+        label.textContent = 'Uploading…';
+      }
+    };
+    request.upload.onload = () => { label.textContent = 'Processing archive…'; };
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 400) {
+        window.location.assign(request.responseURL);
+      } else {
+        label.textContent = request.status === 503
+          ? 'Too many uploads in progress. Please retry shortly.'
+          : 'Upload failed (HTTP ' + request.status + '). Please retry.';
+        button.disabled = false;
+      }
+    };
+    request.onerror = () => {
+      label.textContent = 'Connection failed. Please retry.';
+      button.disabled = false;
+    };
+    request.send(new FormData(form));
+  });
+})();
+</script>)HTML";
     html << pageFooter();
     return html.str();
 }

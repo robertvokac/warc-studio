@@ -30,6 +30,11 @@
 
 [hidden] { display: none !important; }
 
+#upload-progress-panel progress {
+    width: min(100%, 24rem);
+    vertical-align: middle;
+}
+
 * {
     box-sizing: border-box;
 }

@@ -109,6 +109,20 @@ add_executable(warc-studio-regression-tests
 )
 target_link_libraries(warc-studio-regression-tests PRIVATE SQLite::SQLite3)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME crawl-scope COMMAND warc-studio-tests)
+    add_test(NAME capture-util COMMAND warc-studio-util-tests)
+    add_test(NAME regressions COMMAND warc-studio-regression-tests)
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME integration
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_integration.py
+                    $<TARGET_FILE:warc-studio>)
+        set_tests_properties(integration PROPERTIES TIMEOUT 90)
+    endif()
+endif()
+
 foreach(test_target warc-studio-tests warc-studio-util-tests warc-studio-regression-tests)
     target_include_directories(${test_target}
         PRIVATE

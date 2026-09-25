@@ -1,5 +1,5 @@
 diff --git a/include/crow/http_connection.h b/include/crow/http_connection.h
-index 64bbf07..5fd9053 100644
+index 64bbf07..fb7441e 100644
 --- a/include/crow/http_connection.h
 +++ b/include/crow/http_connection.h
 @@ -410,14 +410,22 @@ namespace crow
@@ -29,7 +29,7 @@ index 64bbf07..5fd9053 100644
                  }
              }
              if (close_connection_)
-@@ -498,6 +506,14 @@ namespace crow
+@@ -498,6 +506,23 @@ namespace crow
  
                    if (error_while_reading)
                    {
@@ -38,6 +38,15 @@ index 64bbf07..5fd9053 100644
 +                          self->cancel_deadline_timer();
 +                          self->close_connection_ = true;
 +                          self->res = response(413, "Request body too large");
++                          self->complete_request();
++                          return;
++                      }
++                      if (self->parser_.upload_busy && self->adaptor_.is_open())
++                      {
++                          self->cancel_deadline_timer();
++                          self->close_connection_ = true;
++                          self->res = response(503, "Too many uploads in progress");
++                          self->res.add_header("Retry-After", "5");
 +                          self->complete_request();
 +                          return;
 +                      }
@@ -96,7 +105,7 @@ index fffbffb..639c9ea 100644
          bool completed_{};
          std::function<void()> complete_request_handler_;
 diff --git a/include/crow/parser.h b/include/crow/parser.h
-index 7099e8c..6ad60c9 100644
+index 7099e8c..9fc0ea2 100644
 --- a/include/crow/parser.h
 +++ b/include/crow/parser.h
 @@ -1,6 +1,7 @@
@@ -107,18 +116,20 @@ index 7099e8c..6ad60c9 100644
  #include <unordered_map>
  #include <algorithm>
  
-@@ -9,6 +10,10 @@
+@@ -9,6 +10,12 @@
  
  namespace crow
  {
 +    // Application-wide cap configured before the server starts. Checked while
 +    // parsing so an oversized request never accumulates in request::body.
 +    inline std::atomic<size_t> max_http_body_size{128 * 1024 * 1024};
++    inline std::atomic<size_t> max_concurrent_uploads{2};
++    inline std::atomic<size_t> active_uploads{0};
 +
      /// A wrapper for `nodejs/http-parser`.
  
      ///
-@@ -75,6 +80,12 @@ namespace crow
+@@ -75,6 +82,29 @@ namespace crow
          static int on_headers_complete(http_parser* self_)
          {
              HTTPParser* self = static_cast<HTTPParser*>(self_);
@@ -128,10 +139,27 @@ index 7099e8c..6ad60c9 100644
 +                self->body_too_large = true;
 +                return -1;
 +            }
++            if (self->req.method == HTTPMethod::POST && self->req.url == "/upload")
++            {
++                size_t active = active_uploads.load(std::memory_order_relaxed);
++                while (active < max_concurrent_uploads.load(std::memory_order_relaxed))
++                {
++                    if (active_uploads.compare_exchange_weak(active, active + 1, std::memory_order_acq_rel))
++                    {
++                        self->upload_slot_ = true;
++                        break;
++                    }
++                }
++                if (!self->upload_slot_)
++                {
++                    self->upload_busy = true;
++                    return -1;
++                }
++            }
              if (!self->header_field.empty())
              {
                  self->req.headers.emplace(std::move(self->header_field), std::move(self->header_value));
-@@ -88,6 +99,12 @@ namespace crow
+@@ -88,6 +118,12 @@ namespace crow
          static int on_body(http_parser* self_, const char* at, size_t length)
          {
              HTTPParser* self = static_cast<HTTPParser*>(self_);
@@ -144,19 +172,46 @@ index 7099e8c..6ad60c9 100644
              self->req.body.insert(self->req.body.end(), at, at + length);
              return 0;
          }
-@@ -139,6 +156,7 @@ namespace crow
+@@ -105,6 +141,11 @@ namespace crow
+             http_parser_init(this);
+         }
+ 
++        ~HTTPParser()
++        {
++            release_upload_slot();
++        }
++
+         // return false on error
+         /// Parse a buffer into the different sections of an HTTP request.
+         bool feed(const char* buffer, int length)
+@@ -138,7 +179,10 @@ namespace crow
+ 
          void clear()
          {
++            release_upload_slot();
              req = crow::request();
 +            body_too_large = false;
++            upload_busy = false;
              header_field.clear();
              header_value.clear();
              header_building_state = 0;
-@@ -185,6 +203,7 @@ namespace crow
+@@ -185,8 +229,19 @@ namespace crow
          ///
          /// Data parsed is put directly into this object as soon as the related callback returns. (e.g. the request will have the cooorect method as soon as on_method() returns)
          request req;
 +        bool body_too_large = false;
++        bool upload_busy = false;
  
      private:
++        void release_upload_slot()
++        {
++            if (upload_slot_)
++            {
++                active_uploads.fetch_sub(1, std::memory_order_acq_rel);
++                upload_slot_ = false;
++            }
++        }
++        bool upload_slot_ = false;
          int header_building_state = 0;
+         bool message_complete = false;
+         std::string header_field;

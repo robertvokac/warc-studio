@@ -19,7 +19,12 @@
 #  include <windows.h>
 #elif defined(__APPLE__)
 #  include <mach-o/dyld.h>
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <unistd.h>
 #else
+#  include <fcntl.h>
+#  include <sys/file.h>
 #  include <unistd.h>
 #endif
 #include <iostream>
@@ -74,6 +79,55 @@ struct LocalAccessMw {
 };
 
 namespace {
+
+// Shared with tools/backup.py. A backup or restore must never race with a
+// running crawler, upload, or database write.
+class DataLock {
+public:
+    explicit DataLock(const std::filesystem::path& dataRoot) {
+        const auto path = std::filesystem::weakly_canonical(std::filesystem::absolute(dataRoot)).string() + ".lock";
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+#if defined(_WIN32)
+        handle_ = CreateFileW(std::filesystem::path(path).c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("Could not open data lock: " + path);
+        }
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0, 1, 0, &overlapped_)) {
+            CloseHandle(handle_);
+            throw std::runtime_error("Data directory is already in use: " + path);
+        }
+#else
+        fd_ = open(path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd_ < 0) {
+            throw std::runtime_error("Could not open data lock: " + path);
+        }
+        if (flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+            close(fd_);
+            throw std::runtime_error("Data directory is already in use: " + path);
+        }
+#endif
+    }
+    ~DataLock() {
+#if defined(_WIN32)
+        UnlockFileEx(handle_, 0, 1, 0, &overlapped_);
+        CloseHandle(handle_);
+#else
+        flock(fd_, LOCK_UN);
+        close(fd_);
+#endif
+    }
+    DataLock(const DataLock&) = delete;
+    DataLock& operator=(const DataLock&) = delete;
+private:
+#if defined(_WIN32)
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+    OVERLAPPED overlapped_{};
+#else
+    int fd_{-1};
+#endif
+};
 
 using warc_studio::Capture;
 using warc_studio::CrawlScope;
@@ -337,7 +391,12 @@ int main() {
         if (maxRequestMb < 1 || maxRequestMb > 1024) {
             throw std::runtime_error("WARC_STUDIO_MAX_REQUEST_MB must be between 1 and 1024");
         }
+        const int maxConcurrentUploads = environmentIntOrDefault("WARC_STUDIO_MAX_CONCURRENT_UPLOADS", 2);
+        if (maxConcurrentUploads < 1 || maxConcurrentUploads > 64) {
+            throw std::runtime_error("WARC_STUDIO_MAX_CONCURRENT_UPLOADS must be between 1 and 64");
+        }
         crow::max_http_body_size.store(static_cast<std::size_t>(maxRequestMb) * 1024 * 1024);
+        crow::max_concurrent_uploads.store(static_cast<std::size_t>(maxConcurrentUploads));
         warc_studio::CrawlConfig crawlConfig{
             .userAgent = environmentStringOrDefault("WARC_STUDIO_USER_AGENT", kDefaultUserAgent),
             .workers = environmentIntOrDefault("WARC_STUDIO_CRAWL_WORKERS", 2),
@@ -351,6 +410,7 @@ int main() {
         // WARC_STUDIO_STATIC_DIR override and a CWD fallback for development runs.
         const auto staticRoot = findStaticRoot();
 
+        DataLock dataLock(dataRoot);
         warc_studio::Database database(dataRoot / "warc-studio.sqlite3");
         warc_studio::FileService fileService(dataRoot);
         warc_studio::CrawlService crawler(database, fileService, crawlConfig);

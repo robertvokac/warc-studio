@@ -33,7 +33,8 @@ Capture statuses: `queued` → `crawling` → `archived`, or `failed` / `cancell
 - **Built-in crawler** — see below; runs in background worker threads, no manual start/stop. Captures interrupted by a restart are re-queued. A running crawl can be stopped early (what was fetched so far is kept), a failed one retried.
 - **Browse** captures chronologically (newest or oldest first, grouped by day), **search** by URL or title substring, filter by **tags** (all must match) and status.
 - **URL history** — all captures of one URL, like the Wayback Machine calendar.
-- **Upload** your own `.warc`, `.warc.gz` or `.wacz` — URL, capture date and title are read from the file when not given.
+- **Upload** your own `.warc`, `.warc.gz` or `.wacz` — URL, capture date and title are read from the file when not given. The form shows upload progress and limits concurrent uploads.
+- **Backup and restore** the database and archive files with the verified offline tool in `tools/backup.py`.
 - **Download** any archive file (named `<host>-<timestamp>.<ext>`); file size and SHA-256 are shown everywhere.
 - **Replay** WACZ and WARC files with the locally hosted ReplayWeb.page.
 - **Tags page** — tag cloud, rename (renaming onto an existing tag merges them) and delete.
@@ -79,6 +80,7 @@ Limits: responses larger than `WARC_STUDIO_MAX_RESOURCE_MB` are skipped, at most
 - SQLite3, OpenSSL, zlib and libcurl development headers
   (`libsqlite3-dev libssl-dev zlib1g-dev libcurl4-openssl-dev`)
 - `unzip` (reads page metadata from uploaded WACZ files)
+- Python 3.9+ for the backup/restore tool and integration test
 
 ---
 
@@ -89,7 +91,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Tests: `./build/warc-studio-tests`, `./build/warc-studio-util-tests` and `./build/warc-studio-regression-tests`.
+Tests: `ctest --test-dir build --output-on-failure`. The integration test starts a local fixture site and WARC Studio, crawls and uploads a real WARC, checks replay routes and byte ranges, then tests backup and restore. Python 3 is required for this test.
 
 ## Run
 
@@ -109,6 +111,7 @@ Then open [http://localhost:18080/](http://localhost:18080/). The server listens
 | `WARC_STUDIO_DATA_DIR`          | `data`                                   | SQLite DB, archives, crawl output and logs |
 | `WARC_STUDIO_PORT`              | `18080`                                  | HTTP port |
 | `WARC_STUDIO_MAX_REQUEST_MB`    | `128`                                    | Maximum HTTP request body, including uploaded archives; larger requests receive 413 |
+| `WARC_STUDIO_MAX_CONCURRENT_UPLOADS` | `2`                               | Uploads accepted at once; extra uploads receive 503 and may be retried |
 | `WARC_STUDIO_CRAWL_WORKERS`     | `2`                                      | Number of captures crawled in parallel |
 | `WARC_STUDIO_CRAWL_TIME_LIMIT`  | `0`                                      | Time limit per capture in seconds, `0` = none |
 | `WARC_STUDIO_MAX_RESOURCE_MB`   | `100`                                    | Larger responses are skipped |
@@ -126,6 +129,17 @@ data/
   crawls/capture-<id>.warc.gz                                WARC being written (moved to archives/ when done)
   logs/capture-<id>.log                                      crawl log (every URL with status), shown on the capture page
 ```
+
+## Backup and restore
+
+Stop WARC Studio before using the backup tool. It checks the same data lock as the server, verifies SQLite and every archived capture file, and writes a SHA-256 manifest for all backed-up files. The backup includes the database, archives, crawl logs and unfinished crawl files.
+
+```bash
+python3 tools/backup.py backup /path/to/backup-2026-09-25 --data-dir build/data
+python3 tools/backup.py restore /path/to/backup-2026-09-25 --data-dir build/data
+```
+
+Use the directory from `WARC_STUDIO_DATA_DIR` for `--data-dir` (the default is `data`, relative to the server's working directory). The backup destination must be outside the data directory. Restore validates checksums before changing data and keeps the previous data directory beside it as `data.pre-restore-<timestamp>-<pid>`. Keep a copy of the backup on another disk as well.
 
 ## Database
 
