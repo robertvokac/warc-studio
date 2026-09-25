@@ -178,7 +178,7 @@ std::string pageHeader(const std::string& title, const std::string& activeNav, c
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>)HTML" << htmlEscape(title) << R"HTML( — warc-studio</title>
+  <title>Warc Studio | )HTML" << htmlEscape(title) << R"HTML(</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
 )HTML" << extraHead << R"HTML(</head>
@@ -259,7 +259,7 @@ std::string renderHomePage(const HomeView& view) {
     std::ostringstream html;
     // Refresh while something is crawling, but never while the user may be typing a new URL.
     const bool refresh = view.url.empty() && hasActiveCaptures(view.recentCaptures);
-    html << pageHeader("Save Page Now", "/", refresh ? autoRefresh(10) : "");
+    html << pageHeader("Save", "/", refresh ? autoRefresh(10) : "");
     renderMessage(html, view.message);
 
     html << "<div class=\"card hero\">\n<h1>Save Page Now</h1>\n"
@@ -381,7 +381,7 @@ std::string renderBulkSavePage(const std::vector<TagCount>& allTags, const std::
 std::string renderBrowsePage(const BrowseView& view) {
     std::ostringstream html;
     const auto& q = view.query;
-    html << pageHeader("Browse captures", "/captures",
+    html << pageHeader("Browse", "/captures",
                        hasActiveCaptures(view.captures) ? autoRefresh(10) : "", q.urlContains);
     renderMessage(html, view.message);
 
@@ -448,7 +448,7 @@ std::string renderBrowsePage(const BrowseView& view) {
 std::string renderUrlPage(const std::string& url, const std::vector<Capture>& captures,
                           const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
     std::ostringstream html;
-    html << pageHeader("History of " + url, "/captures", hasActiveCaptures(captures) ? autoRefresh(10) : "");
+    html << pageHeader("History: " + url, "/captures", hasActiveCaptures(captures) ? autoRefresh(10) : "");
     renderMessage(html, message);
 
     html << "<div class=\"page-title\"><h1 class=\"break\">" << htmlEscape(url) << "</h1>\n"
@@ -501,7 +501,7 @@ std::string renderCapturePage(const Capture& capture, const std::string& logTail
                               const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
     std::ostringstream html;
     const bool active = capture.status == "queued" || capture.status == "crawling";
-    html << pageHeader(displayTitle(capture), "/captures", active ? autoRefresh(5) : "");
+    html << pageHeader("Capture: " + displayTitle(capture), "/captures", active ? autoRefresh(5) : "");
     renderMessage(html, message);
 
     const std::string base = "/capture/" + std::to_string(capture.id);
@@ -650,7 +650,7 @@ std::string renderTagsPage(const std::vector<TagCount>& tags, const std::optiona
 
 std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::optional<std::string>& message) {
     std::ostringstream html;
-    html << pageHeader("Upload archive", "/upload");
+    html << pageHeader("Upload", "/upload");
     renderMessage(html, message);
     html << "<div class=\"card\">\n<h1>Upload a WARC / WACZ file</h1>\n"
          << "<p class=\"muted\">The file becomes a capture of its own. URL, date and title are read from the file "
@@ -727,8 +727,8 @@ std::string renderUploadPage(const std::vector<TagCount>& allTags, const std::op
 std::string renderReplayPage(const Capture& capture, const std::string& archiveSource) {
     std::ostringstream html;
     html << "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
-         << "<title>" << htmlEscape(displayTitle(capture)) << " (" << htmlEscape(formatTimestamp(capture.timestamp))
-         << ") — warc-studio</title>\n"
+         << "<title>Warc Studio | Replay: " << htmlEscape(displayTitle(capture)) << " ("
+         << htmlEscape(formatTimestamp(capture.timestamp)) << ")</title>\n"
          << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\n"
          // ui.js is loaded from /replay/ui.js — same path as replayBase so SW registration works.
          << "<script src=\"/replay/ui.js\"></script>\n"

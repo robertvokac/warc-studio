@@ -469,7 +469,7 @@ int main() {
         auto replayShellHandler = []() {
             crow::response res(200,
                 "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n"
-                "  <title>warc-studio replay shell</title>\n"
+                "  <title>Warc Studio | Replay</title>\n"
                 "  <script src=\"/replay/ui.js\"></script>\n</head>\n"
                 "<body>\n  <replay-app-main></replay-app-main>\n</body>\n</html>\n");
             res.add_header("Content-Type", "text/html; charset=utf-8");
