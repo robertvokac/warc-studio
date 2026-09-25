@@ -1,0 +1,50 @@
+name: Publish website to GitHub Pages
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - web/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify website files
+        run: |
+          test -s web/index.html
+          test -s web/styles.css
+          test -s web/favicon.svg
+          test -s web/assets/save-page.png
+          test -s web/assets/browse-captures.png
+          test -s web/assets/capture-detail.png
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: web
+
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v5

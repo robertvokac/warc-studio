@@ -6,6 +6,8 @@ Every archiving request becomes its own **capture**: one timestamped WARC file.
 
 Built with **C++23**, **CMake**, **Crow**, **SQLite**, **libcurl** and **ReplayWeb.page**. No Docker, no external crawler.
 
+The English presentation website is in [`web/`](web/).
+
 ---
 
 ## Concepts

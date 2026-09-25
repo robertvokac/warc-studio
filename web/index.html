@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f7fb">
+  <meta name="description" content="WARC Studio is a personal, local web archive. Capture pages in WARC files, organize them with tags, and replay them later.">
+  <title>WARC Studio — Your corner of the web, kept</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header" id="top">
+    <div class="container header-inner">
+      <a class="brand" href="#top" aria-label="WARC Studio home"><img src="favicon.svg" width="34" height="34" alt=""><span>warc<span class="brand-hyphen">-</span>studio</span></a>
+      <nav aria-label="Main navigation">
+        <a href="#product">The app</a>
+        <a href="#capabilities">What it does</a>
+        <a href="#get-started">Get started</a>
+      </nav>
+      <a class="header-github" href="https://github.com/robertvokac/warc-studio">GitHub <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="container">
+        <div class="hero-topline"><span class="eyebrow"><span class="signal" aria-hidden="true"></span> PERSONAL WEB ARCHIVING</span><span class="topline-right">BUILT TO RUN LOCALLY / C++23</span></div>
+        <div class="hero-intro">
+          <div>
+            <h1 id="hero-title">Your corner of<br>the web, <em>kept.</em></h1>
+          </div>
+          <div class="hero-side">
+            <p>Save the pages you care about. WARC Studio captures them on your computer, keeps each version in its own WARC file, and lets you find and replay them later.</p>
+            <div class="hero-actions"><a class="button button-blue" href="#get-started">Get WARC Studio <span aria-hidden="true">↗</span></a><a class="under-link" href="#product">See the app <span aria-hidden="true">↓</span></a></div>
+          </div>
+        </div>
+        <figure class="hero-screen">
+          <div class="screen-header"><span class="screen-label"><span class="screen-mark" aria-hidden="true">●</span> WARC STUDIO / SAVE PAGE NOW</span><span class="screen-local">LOCAL APPLICATION</span></div>
+          <a href="assets/save-page.png" target="_blank" rel="noopener" aria-label="Open full-size screenshot of the Save Page Now screen"><img src="assets/save-page.png" width="1440" height="900" alt="Actual WARC Studio Save Page Now screen, showing the URL form and recent captures in a sample collection"></a>
+        </figure>
+        <div class="hero-screen-caption"><span>01 / SAVE A PAGE</span><span>Real application screenshot · sample local collection</span><a href="assets/save-page.png" target="_blank" rel="noopener">View full size ↗</a></div>
+      </div>
+    </section>
+
+    <div class="fact-strip" aria-label="At a glance"><div class="container fact-inner"><div><strong>01</strong><span>One file per capture</span></div><div><strong>02</strong><span>Built-in crawler</span></div><div><strong>03</strong><span>Local replay</span></div><div><strong>04</strong><span>No Docker needed</span></div></div></div>
+
+    <section class="product-section section-pad" id="product" aria-labelledby="product-title">
+      <div class="container">
+        <div class="section-header"><div><p class="section-label">THE ACTUAL APP / 02</p><h2 id="product-title">A collection you can<br>come back to.</h2></div><p>From an individual page to a growing personal archive, everything stays searchable and close at hand.</p></div>
+
+        <article class="showcase">
+          <div class="showcase-copy"><span class="chapter-number">01 / FIND</span><h3>Browse what you saved.</h3><p>Search captures by URL or title, filter by tags and status, and switch between newest and oldest first. Every capture has its own timestamp.</p><ul class="quiet-list"><li>Chronological browsing</li><li>Tags and status filters</li><li>URL capture history</li></ul></div>
+          <figure class="showcase-screen"><a href="assets/browse-captures.png" target="_blank" rel="noopener" aria-label="Open full-size screenshot of the Captures screen"><img src="assets/browse-captures.png" width="1440" height="900" loading="lazy" alt="Actual WARC Studio Captures screen with search and filters above three saved sample pages"></a><figcaption>Captures screen <a href="assets/browse-captures.png" target="_blank" rel="noopener">View full size ↗</a></figcaption></figure>
+        </article>
+
+        <article class="showcase showcase-reverse">
+          <div class="showcase-copy"><span class="chapter-number">02 / REVISIT</span><h3>Keep every version.</h3><p>Open a capture to see its timestamp, tags, file details, and SHA-256 checksum. Replay the saved page, download its WARC file, or archive it again.</p><ul class="quiet-list"><li>Replay with ReplayWeb.page</li><li>Downloadable archive files</li><li>Capture details and checksum</li></ul></div>
+          <figure class="showcase-screen"><a href="assets/capture-detail.png" target="_blank" rel="noopener" aria-label="Open full-size screenshot of a capture detail"><img src="assets/capture-detail.png" width="1440" height="900" loading="lazy" alt="Actual WARC Studio capture detail showing replay and download controls, timestamp, file path, and checksum"></a><figcaption>Capture detail <a href="assets/capture-detail.png" target="_blank" rel="noopener">View full size ↗</a></figcaption></figure>
+        </article>
+      </div>
+    </section>
+
+    <section class="capabilities-section section-pad" id="capabilities" aria-labelledby="capabilities-title">
+      <div class="container">
+        <div class="section-header capabilities-heading"><div><p class="section-label">YOUR ARCHIVE / 03</p><h2 id="capabilities-title">The useful parts,<br>all in one place.</h2></div><p>A straightforward workflow for collecting and keeping pages, with no external crawler to configure.</p></div>
+        <div class="capability-grid">
+          <article><span>01 — CAPTURE</span><h3>Choose your scope</h3><p>Save just one page or follow links by depth, domain, or path. Set a page limit when you need one.</p></article>
+          <article><span>02 — ORGANIZE</span><h3>Give it context</h3><p>Add titles and tags, save many URLs in one batch, or use the bookmarklet while browsing.</p></article>
+          <article><span>03 — IMPORT</span><h3>Bring files along</h3><p>Upload existing <code>.warc</code>, <code>.warc.gz</code>, and <code>.wacz</code> archives.</p></article>
+          <article><span>04 — PROTECT</span><h3>Back it up</h3><p>Back up and restore your database, archive files, crawl logs, and unfinished captures.</p></article>
+        </div>
+        <div class="honest-note"><span class="note-symbol" aria-hidden="true">i</span><div><strong>A clear limit</strong><p>The crawler does not execute JavaScript. Pages that fetch content dynamically may be incomplete in the archive.</p></div><a href="https://github.com/robertvokac/warc-studio#built-in-crawler">How the crawler works ↗</a></div>
+      </div>
+    </section>
+
+    <section class="start-section section-pad" id="get-started" aria-labelledby="start-title"><div class="container start-grid"><div class="start-copy"><p class="section-label">GET STARTED / 04</p><h2 id="start-title">Ready to keep<br>a page?</h2><p>Build WARC Studio from source, run it on your computer, and open the local app in your browser.</p><a class="button button-white" href="https://github.com/robertvokac/warc-studio">View source on GitHub <span aria-hidden="true">↗</span></a></div><div class="terminal"><div class="terminal-top"><span>QUICK START</span><span>TERMINAL</span></div><pre><code><span class="code-comment"># From the project directory</span>
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cd build
+./warc-studio</code></pre><div class="terminal-bottom">Then open <strong>http://localhost:18080/</strong></div></div></div><div class="container requirement-line">Requires a C++23 compiler, CMake 3.26+, SQLite3, OpenSSL, zlib, libcurl, and unzip. <a href="https://github.com/robertvokac/warc-studio#requirements">Full requirements ↗</a></div></section>
+  </main>
+
+  <footer class="site-footer"><div class="container footer-inner"><a class="brand" href="#top"><img src="favicon.svg" width="34" height="34" alt=""><span>warc<span class="brand-hyphen">-</span>studio</span></a><p>A personal, local web archive.</p><a href="https://github.com/robertvokac/warc-studio">GitHub ↗</a></div></footer>
+</body>
+</html>
