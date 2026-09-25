@@ -41,6 +41,10 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
     GIT_TAG        v1.2.0
     GIT_SHALLOW    TRUE
+    PATCH_COMMAND ${CMAKE_COMMAND}
+        -DCROW_SOURCE_DIR=<SOURCE_DIR>
+        -DCROW_PATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/crow-local-fixes.patch
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_crow_patch.cmake
 )
 # Do not build Crow's own tests/examples
 set(CROW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -96,7 +100,16 @@ add_executable(warc-studio-util-tests
     tests/test_capture_util.cpp
 )
 
-foreach(test_target warc-studio-tests warc-studio-util-tests)
+add_executable(warc-studio-regression-tests
+    src/CaptureUtil.cpp
+    src/Database.cpp
+    src/Html.cpp
+    src/HttpUtil.cpp
+    tests/test_regressions.cpp
+)
+target_link_libraries(warc-studio-regression-tests PRIVATE SQLite::SQLite3)
+
+foreach(test_target warc-studio-tests warc-studio-util-tests warc-studio-regression-tests)
     target_include_directories(${test_target}
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include

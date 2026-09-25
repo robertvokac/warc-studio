@@ -634,8 +634,7 @@ std::string renderTagsPage(const std::vector<TagCount>& tags, const std::optiona
              << "<td><form method=\"post\" action=\"/tags/rename\"><input type=\"hidden\" name=\"from\" value=\""
              << htmlEscape(tag.name) << "\"><input type=\"text\" name=\"to\" value=\"" << htmlEscape(tag.name)
              << "\" size=\"18\"><button class=\"btn-sm btn-secondary\">Rename</button></form></td>"
-             << "<td><form method=\"post\" action=\"/tags/delete\" onsubmit=\"return confirm('Remove tag &quot;"
-             << htmlEscape(tag.name) << "&quot; from all captures? The captures are kept.')\">"
+             << "<td><form method=\"post\" action=\"/tags/delete\" onsubmit=\"return confirm('Remove this tag from all captures? The captures are kept.')\">"
              << "<input type=\"hidden\" name=\"name\" value=\"" << htmlEscape(tag.name) << "\">"
              << "<button class=\"btn-sm btn-danger\">Delete</button></form></td></tr>\n";
     }

@@ -89,7 +89,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Tests: `./build/warc-studio-tests` and `./build/warc-studio-util-tests`.
+Tests: `./build/warc-studio-tests`, `./build/warc-studio-util-tests` and `./build/warc-studio-regression-tests`.
 
 ## Run
 
@@ -98,7 +98,7 @@ cd build
 ./warc-studio
 ```
 
-Then open [http://localhost:18080/](http://localhost:18080/).
+Then open [http://localhost:18080/](http://localhost:18080/). The server listens only on `127.0.0.1`.
 
 ---
 
@@ -108,6 +108,7 @@ Then open [http://localhost:18080/](http://localhost:18080/).
 |---------------------------------|------------------------------------------|-------------|
 | `WARC_STUDIO_DATA_DIR`          | `data`                                   | SQLite DB, archives, crawl output and logs |
 | `WARC_STUDIO_PORT`              | `18080`                                  | HTTP port |
+| `WARC_STUDIO_MAX_REQUEST_MB`    | `128`                                    | Maximum HTTP request body, including uploaded archives; larger requests receive 413 |
 | `WARC_STUDIO_CRAWL_WORKERS`     | `2`                                      | Number of captures crawled in parallel |
 | `WARC_STUDIO_CRAWL_TIME_LIMIT`  | `0`                                      | Time limit per capture in seconds, `0` = none |
 | `WARC_STUDIO_MAX_RESOURCE_MB`   | `100`                                    | Larger responses are skipped |
@@ -128,7 +129,7 @@ data/
 
 ## Database
 
-Schema version **7** — tables `capture`, `tag`, `capture_tag` (see `sql/schema.sql`).
+Schema version **8** — tables `capture`, `tag`, `capture_tag` (see `src/Database.cpp`).
 Migrations run automatically at startup. Migration 6 converts the old collections/entries model:
 every old archive file becomes an archived capture, entries without an archive file become failed
 captures (so no URL is lost — use *Archive again*), entry tags are kept, collections are dropped.
@@ -158,7 +159,7 @@ GET  /capture/<id>/download     Download the archive file
 GET  /tags, POST /tags/rename, POST /tags/delete
 GET  /upload, POST /upload      Upload own WARC/WACZ (file, url, tags, title, timestamp, note)
 GET  /about                     Settings, statistics, bookmarklet
-GET  /archives/<path>           Archive files for ReplayWeb.page (CORS, Range support)
+GET  /archives/<path>           Archive files for locally hosted ReplayWeb.page (Range support)
 GET  /replay/ui.js, /replay/sw.js, /replay/...   ReplayWeb.page (self-hosted)
 GET  /health
 ```
@@ -173,6 +174,6 @@ so archives and player share one origin and there is no mixed-content problem.
 If a replay shows "No Results Found":
 
 1. Check the file downloads: `curl -o /tmp/test.wacz http://localhost:18080/capture/<id>/download`
-2. Check CORS and Range: `curl -I -H "Range: bytes=0-1023" http://localhost:18080/archives/<path>` — expect `206` with `Access-Control-Allow-Origin: *`
+2. Check Range support: `curl -I -H "Range: bytes=0-1023" http://localhost:18080/archives/<path>` — expect `206` with `Content-Range`.
 3. Clear a stale service worker: DevTools → Application → Service Workers → Unregister, then hard refresh.
 4. Try a private window.

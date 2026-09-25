@@ -1,0 +1,162 @@
+diff --git a/include/crow/http_connection.h b/include/crow/http_connection.h
+index 64bbf07..5fd9053 100644
+--- a/include/crow/http_connection.h
++++ b/include/crow/http_connection.h
+@@ -410,14 +410,22 @@ namespace crow
+             if (res.file_info.statResult == 0)
+             {
+                 std::ifstream is(res.file_info.path.c_str(), std::ios::in | std::ios::binary);
++                if (res.file_info.has_range)
++                    is.seekg(static_cast<std::streamoff>(res.file_info.offset));
+                 std::vector<asio::const_buffer> buffers{1};
+                 char buf[16384];
+-                is.read(buf, sizeof(buf));
+-                while (is.gcount() > 0)
++                std::uint64_t remaining = res.file_info.length;
++                while (is && (!res.file_info.has_range || remaining > 0))
+                 {
+-                    buffers[0] = asio::buffer(buf, is.gcount());
++                    const auto to_read = res.file_info.has_range && remaining < sizeof(buf)
++                        ? static_cast<std::streamsize>(remaining) : static_cast<std::streamsize>(sizeof(buf));
++                    is.read(buf, to_read);
++                    const auto count = is.gcount();
++                    if (count <= 0) break;
++                    buffers[0] = asio::buffer(buf, count);
+                     do_write_sync(buffers);
+-                    is.read(buf, sizeof(buf));
++                    if (res.file_info.has_range)
++                        remaining -= static_cast<std::uint64_t>(count);
+                 }
+             }
+             if (close_connection_)
+@@ -498,6 +506,14 @@ namespace crow
+ 
+                   if (error_while_reading)
+                   {
++                      if (self->parser_.body_too_large && self->adaptor_.is_open())
++                      {
++                          self->cancel_deadline_timer();
++                          self->close_connection_ = true;
++                          self->res = response(413, "Request body too large");
++                          self->complete_request();
++                          return;
++                      }
+                       self->cancel_deadline_timer();
+                       self->parser_.done();
+                       self->adaptor_.shutdown_read();
+diff --git a/include/crow/http_response.h b/include/crow/http_response.h
+index fffbffb..639c9ea 100644
+--- a/include/crow/http_response.h
++++ b/include/crow/http_response.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <string>
++#include <cstdint>
+ #include <unordered_map>
+ #include <ios>
+ #include <fstream>
+@@ -241,7 +242,8 @@ namespace crow
+                 completed_ = true;
+                 if (skip_body)
+                 {
+-                    set_header("Content-Length", std::to_string(body.size()));
++                    if (!headers.count("Content-Length"))
++                        set_header("Content-Length", std::to_string(body.size()));
+                     body = "";
+                     manual_length_header = true;
+                 }
+@@ -282,6 +284,9 @@ namespace crow
+             std::string path = "";
+             struct stat statbuf;
+             int statResult;
++            std::uint64_t offset = 0;
++            std::uint64_t length = 0;
++            bool has_range = false;
+         };
+ 
+         /// Return a static file as the response body
+@@ -318,6 +323,19 @@ namespace crow
+             }
+         }
+ 
++        /// Stream a validated byte range from a static file without buffering it.
++        void set_static_file_range_info_unsafe(std::string path, std::uint64_t offset, std::uint64_t length)
++        {
++            set_static_file_info_unsafe(std::move(path));
++            if (code == 200)
++            {
++                file_info.offset = offset;
++                file_info.length = length;
++                file_info.has_range = true;
++                set_header("Content-Length", std::to_string(length));
++            }
++        }
++
+     private:
+         bool completed_{};
+         std::function<void()> complete_request_handler_;
+diff --git a/include/crow/parser.h b/include/crow/parser.h
+index 7099e8c..6ad60c9 100644
+--- a/include/crow/parser.h
++++ b/include/crow/parser.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <string>
++#include <atomic>
+ #include <unordered_map>
+ #include <algorithm>
+ 
+@@ -9,6 +10,10 @@
+ 
+ namespace crow
+ {
++    // Application-wide cap configured before the server starts. Checked while
++    // parsing so an oversized request never accumulates in request::body.
++    inline std::atomic<size_t> max_http_body_size{128 * 1024 * 1024};
++
+     /// A wrapper for `nodejs/http-parser`.
+ 
+     ///
+@@ -75,6 +80,12 @@ namespace crow
+         static int on_headers_complete(http_parser* self_)
+         {
+             HTTPParser* self = static_cast<HTTPParser*>(self_);
++            if (self->content_length != CROW_ULLONG_MAX &&
++                self->content_length > max_http_body_size.load(std::memory_order_relaxed))
++            {
++                self->body_too_large = true;
++                return -1;
++            }
+             if (!self->header_field.empty())
+             {
+                 self->req.headers.emplace(std::move(self->header_field), std::move(self->header_value));
+@@ -88,6 +99,12 @@ namespace crow
+         static int on_body(http_parser* self_, const char* at, size_t length)
+         {
+             HTTPParser* self = static_cast<HTTPParser*>(self_);
++            const size_t limit = max_http_body_size.load(std::memory_order_relaxed);
++            if (self->req.body.size() > limit || length > limit - self->req.body.size())
++            {
++                self->body_too_large = true;
++                return 1;
++            }
+             self->req.body.insert(self->req.body.end(), at, at + length);
+             return 0;
+         }
+@@ -139,6 +156,7 @@ namespace crow
+         void clear()
+         {
+             req = crow::request();
++            body_too_large = false;
+             header_field.clear();
+             header_value.clear();
+             header_building_state = 0;
+@@ -185,6 +203,7 @@ namespace crow
+         ///
+         /// Data parsed is put directly into this object as soon as the related callback returns. (e.g. the request will have the cooorect method as soon as on_method() returns)
+         request req;
++        bool body_too_large = false;
+ 
+     private:
+         int header_building_state = 0;

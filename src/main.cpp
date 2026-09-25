@@ -9,6 +9,7 @@
 #include <crow/multipart.h>
 #include <curl/curl.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -36,27 +37,37 @@ static constexpr const char* kDefaultUserAgent =
     "warc-studio/0.4";
 
 // ---------------------------------------------------------------------------
-// CORS middleware — injects full CORS + Private Network Access headers on
-// every /archives/... response so that ReplayWeb.page (which may be loaded
-// from a different origin) can fetch WACZ files from our local HTTP server.
-// Crow handles OPTIONS internally before our route handlers run, so we must
-// inject these headers via after_handle to cover preflight responses.
+// ReplayWeb.page is hosted on this same origin. Reject cross-origin mutations
+// and DNS-rebinding hostnames, and expose byte ranges without cross-origin CORS.
 // ---------------------------------------------------------------------------
-struct CorsMw {
+struct LocalAccessMw {
     struct context {};
 
-    void before_handle(crow::request& /*req*/, crow::response& /*res*/, context& /*ctx*/) {}
+    void before_handle(crow::request& req, crow::response& res, context& /*ctx*/) {
+        auto host = req.get_header_value("Host");
+        std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) { return std::tolower(c); });
+        const bool localHost = host == "localhost" || host.starts_with("localhost:")
+            || host == "127.0.0.1" || host.starts_with("127.0.0.1:");
+        if (!localHost) {
+            res = crow::response(403, "Local host required");
+            res.end();
+            return;
+        }
+        if (req.method == crow::HTTPMethod::POST) {
+            auto origin = req.get_header_value("Origin");
+            std::transform(origin.begin(), origin.end(), origin.begin(), [](unsigned char c) { return std::tolower(c); });
+            const auto fetchSite = req.get_header_value("Sec-Fetch-Site");
+            if ((!origin.empty() && origin != "http://" + host)
+                || fetchSite == "cross-site" || fetchSite == "same-site") {
+                res = crow::response(403, "Cross-origin request rejected");
+                res.end();
+            }
+        }
+    }
 
     void after_handle(crow::request& req, crow::response& res, context& /*ctx*/) {
-        // Only add CORS headers to /archives/ responses to avoid polluting others.
+        // ReplayWeb.page runs on this origin; only range capability is needed.
         if (req.url.rfind("/archives/", 0) == 0 || req.url == "/archives") {
-            res.add_header("Access-Control-Allow-Origin", "*");
-            res.add_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-            res.add_header("Access-Control-Allow-Headers",
-                "Range, Content-Type, Access-Control-Request-Private-Network");
-            res.add_header("Access-Control-Expose-Headers",
-                "Accept-Ranges, Content-Length, Content-Range");
-            res.add_header("Access-Control-Allow-Private-Network", "true");
             res.add_header("Accept-Ranges", "bytes");
         }
     }
@@ -322,6 +333,11 @@ int main() {
     try {
         const auto dataRoot = environmentPathOrDefault("WARC_STUDIO_DATA_DIR", "data");
         const auto port = static_cast<std::uint16_t>(environmentIntOrDefault("WARC_STUDIO_PORT", 18080));
+        const int maxRequestMb = environmentIntOrDefault("WARC_STUDIO_MAX_REQUEST_MB", 128);
+        if (maxRequestMb < 1 || maxRequestMb > 1024) {
+            throw std::runtime_error("WARC_STUDIO_MAX_REQUEST_MB must be between 1 and 1024");
+        }
+        crow::max_http_body_size.store(static_cast<std::size_t>(maxRequestMb) * 1024 * 1024);
         warc_studio::CrawlConfig crawlConfig{
             .userAgent = environmentStringOrDefault("WARC_STUDIO_USER_AGENT", kDefaultUserAgent),
             .workers = environmentIntOrDefault("WARC_STUDIO_CRAWL_WORKERS", 2),
@@ -340,7 +356,7 @@ int main() {
         warc_studio::CrawlService crawler(database, fileService, crawlConfig);
         crawler.start();
 
-        crow::App<CorsMw> app;
+        crow::App<LocalAccessMw> app;
 
         // -----------------------------------------------------------------------
         // Static assets
@@ -857,7 +873,7 @@ int main() {
         );
 
         // -----------------------------------------------------------------------
-        // Archive file serving (CORS-enabled for ReplayWeb.page)
+        // Archive file serving for the locally hosted ReplayWeb.page
         // -----------------------------------------------------------------------
 
         CROW_ROUTE(app, "/archives/<path>").methods(crow::HTTPMethod::OPTIONS)(
@@ -878,11 +894,11 @@ int main() {
             }
         );
 
-        std::cout << "warc-studio is listening on http://localhost:" << port << "/\n";
+        std::cout << "warc-studio is listening on http://127.0.0.1:" << port << "/\n";
         std::cout << "Data directory: " << fileService.dataRoot() << "\n";
         std::cout << "Static files: " << staticRoot << "\n";
         app.loglevel(crow::LogLevel::Warning);
-        app.port(port).multithreaded().run();
+        app.bindaddr("127.0.0.1").port(port).multithreaded().run();
 
     } catch (const std::exception& error) {
         std::cerr << "Fatal error: " << error.what() << '\n';

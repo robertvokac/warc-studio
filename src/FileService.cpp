@@ -17,26 +17,9 @@ namespace warc_studio {
 namespace {
 
 void addArchiveHeaders(crow::response& response) {
-    // Content-Type is set here per-response.
-    // Accept-Ranges, CORS, and Private Network Access headers are injected
-    // globally by CorsMw middleware in main.cpp so that Crow-internal OPTIONS
-    // responses also receive them without duplication.
-    response.add_header("Content-Type", "application/octet-stream");
-}
-
-std::string readBytes(const std::filesystem::path& path, std::uintmax_t start, std::uintmax_t length) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("Could not open archive file");
-    }
-
-    input.seekg(static_cast<std::streamoff>(start), std::ios::beg);
-
-    std::string buffer;
-    buffer.resize(static_cast<std::size_t>(length));
-    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-    buffer.resize(static_cast<std::size_t>(input.gcount()));
-    return buffer;
+    // Content-Type is set here per-response. Accept-Ranges is added by the
+    // middleware for all archive responses, including Crow-internal OPTIONS.
+    response.set_header("Content-Type", "application/octet-stream");
 }
 
 bool startsWith(const std::string& value, const std::string& prefix) {
@@ -436,7 +419,21 @@ crow::response FileService::serveArchive(const crow::request& request, const std
         const int status = partial ? 206 : 200;
 
         const bool isHead = request.method == crow::HTTPMethod::Head;
-        crow::response response(status, isHead ? "" : readBytes(path, start, length));
+        if (!isHead) {
+            crow::response response;
+            if (partial) {
+                response.set_static_file_range_info_unsafe(path.string(), start, length);
+                if (response.code != 200) return crow::response(404, "Archive file not found");
+                response.code = 206;
+                response.set_header("Content-Range",
+                    "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" + std::to_string(fileSize));
+            } else {
+                response.set_static_file_info_unsafe(path.string());
+            }
+            addArchiveHeaders(response);
+            return response;
+        }
+        crow::response response(status, "");
         addArchiveHeaders(response);
         response.add_header("Content-Length", std::to_string(length));
         if (partial) {

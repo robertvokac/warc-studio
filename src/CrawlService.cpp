@@ -23,10 +23,10 @@ CrawlService::~CrawlService() {
         }
     }
     wake_.notify_all();
-    // Running crawls notice the stop flag within a moment; do not block shutdown on them.
-    // Interrupted crawls are re-queued on the next start.
+    // Workers access this service, the database and the file service. Wait for them
+    // before any of those objects can be destroyed.
     for (auto& thread : threads_) {
-        thread.detach();
+        thread.join();
     }
 }
 

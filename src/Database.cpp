@@ -653,15 +653,24 @@ std::vector<Capture> Database::listCapturesForUrlKey(const std::string& urlKey) 
 
 std::optional<Capture> Database::findNearestCapture(const std::string& urlKey, const std::string& timestamp) const {
     std::lock_guard lock(mutex_);
-    // Timestamps are 14-digit strings, so their numeric distance orders them by time closely enough.
+    if (!isTimestamp(timestamp)) {
+        return std::nullopt;
+    }
+    const std::string target = timestamp.substr(0, 4) + "-" + timestamp.substr(4, 2) + "-"
+        + timestamp.substr(6, 2) + " " + timestamp.substr(8, 2) + ":"
+        + timestamp.substr(10, 2) + ":" + timestamp.substr(12, 2);
     Statement stmt(db_, (std::string("SELECT ") + kCaptureColumns + R"SQL(
         FROM capture c
         WHERE c.url_key = ? AND c.status = 'archived'
-        ORDER BY ABS(CAST(c.timestamp AS INTEGER) - CAST(? AS INTEGER)), c.id DESC
+        ORDER BY ABS(CAST(strftime('%s', substr(c.timestamp, 1, 4) || '-' ||
+            substr(c.timestamp, 5, 2) || '-' || substr(c.timestamp, 7, 2) || ' ' ||
+            substr(c.timestamp, 9, 2) || ':' || substr(c.timestamp, 11, 2) || ':' ||
+            substr(c.timestamp, 13, 2)) AS INTEGER) -
+            CAST(strftime('%s', ?) AS INTEGER)), c.id DESC
         LIMIT 1;
     )SQL").c_str());
     stmt.bindText(1, urlKey);
-    stmt.bindText(2, timestamp);
+    stmt.bindText(2, target);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return readCapture(stmt.get());
     }
